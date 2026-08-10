@@ -7,11 +7,22 @@ use std::env;
 use chrono::Local;
 use image::{RgbaImage, ImageFormat};
 use sha2::{Sha256, Digest};
+use tiny_http::{Server, Response, Header};
+use serde::Serialize;
+
+// This struct represents one clip as we'll send it to the browser as JSON.
+// `#[derive(Serialize)]` auto-generates the code to convert this into JSON —
+// without it, we'd have to hand-write that conversion ourselves.
+#[derive(Serialize)]
+struct ClipJson {
+    id: i64,
+    content: String,
+    content_type: String,
+    created_at: String,
+    ocr_text: Option<String>,
+}
 
 fn main() {
-    // env::args() gives us the command-line arguments. The first one (index 0)
-    // is always the program's own path, so real arguments start at index 1.
-    // .collect() turns the iterator into a Vec<String> we can inspect normally.
     let args: Vec<String> = env::args().collect();
 
     let conn = Connection::open("clipboard.db").expect("Failed to open database");
@@ -29,23 +40,139 @@ fn main() {
         [],
     ).expect("Failed to create table");
 
-    // If the user ran: cargo run -- search "some query"
-    // args[1] will be "search" and args[2] will be the query text.
     if args.len() >= 3 && args[1] == "search" {
         let query = &args[2];
         run_search(&conn, query);
+    } else if args.len() >= 2 && args[1] == "serve" {
+        run_server(conn);
     } else {
         run_watcher(&conn);
     }
 }
 
-// Searches both `content` and `ocr_text` columns for the query, case-insensitively.
+// --- WEB SERVER ---
+
+fn run_server(conn: Connection) {
+    let server = Server::http("127.0.0.1:8080").expect("Failed to start server");
+    println!("Server running at http://127.0.0.1:8080");
+
+    // `server.incoming_requests()` blocks and waits for each incoming HTTP request,
+    // one at a time — this is a simple single-threaded server, which is fine for
+    // a local single-user tool like this.
+    for request in server.incoming_requests() {
+        let url = request.url().to_string();
+
+        if url == "/" || url == "/index.html" {
+            serve_html(request);
+        } else if url.starts_with("/api/clips") {
+            serve_clips_json(&conn, request, None);
+        } else if url.starts_with("/api/search") {
+            // Extract the "q" parameter manually from something like "/api/search?q=hello"
+            let query_param = url
+                .split('?')
+                .nth(1)
+                .and_then(|qs| qs.split('&').find(|p| p.starts_with("q=")))
+                .map(|p| p.trim_start_matches("q="))
+                .map(|q| urlencoding_decode(q));
+
+            serve_clips_json(&conn, request, query_param);
+        } else if url.starts_with("/clip_images/") {
+            serve_image_file(request, &url);
+        } else {
+            let response = Response::from_string("Not found").with_status_code(404);
+            let _ = request.respond(response);
+        }
+    }
+}
+
+// A very small, dependency-free URL-decoder for the common cases (spaces as %20 or +).
+// Good enough for our search box; not a full RFC-compliant decoder.
+fn urlencoding_decode(s: &str) -> String {
+    s.replace('+', " ").replace("%20", " ")
+}
+
+fn serve_html(request: tiny_http::Request) {
+    // include_str! embeds the file's contents into the compiled binary at
+    // COMPILE time (not read from disk at runtime). The path is relative to
+    // this source file's location.
+    let html = include_str!("../static/index.html");
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
+    let response = Response::from_string(html).with_header(header);
+    let _ = request.respond(response);
+}
+
+fn serve_clips_json(conn: &Connection, request: tiny_http::Request, search_query: Option<String>) {
+    let clips = match &search_query {
+        Some(q) if !q.trim().is_empty() => fetch_clips(conn, Some(q)),
+        _ => fetch_clips(conn, None),
+    };
+
+    let json = serde_json::to_string(&clips).expect("Failed to serialize clips");
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = Response::from_string(json).with_header(header);
+    let _ = request.respond(response);
+}
+
+fn serve_image_file(request: tiny_http::Request, url: &str) {
+    // url looks like "/clip_images/20260810_075408.png" — strip the leading slash
+    // to turn it into a relative file path we can open.
+    let path = url.trim_start_matches('/');
+
+    match fs::read(path) {
+        Ok(bytes) => {
+            let header = Header::from_bytes(&b"Content-Type"[..], &b"image/png"[..]).unwrap();
+            let response = Response::from_data(bytes).with_header(header);
+            let _ = request.respond(response);
+        }
+        Err(_) => {
+            let response = Response::from_string("Image not found").with_status_code(404);
+            let _ = request.respond(response);
+        }
+    }
+}
+
+// Shared by both the plain "list everything" case and the "search" case.
+fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
+    let (sql, pattern);
+    if let Some(q) = search_query {
+        sql = "SELECT id, content, content_type, created_at, ocr_text
+               FROM clips
+               WHERE content LIKE ?1 OR ocr_text LIKE ?1
+               ORDER BY created_at DESC LIMIT 100";
+        pattern = format!("%{}%", q);
+    } else {
+        sql = "SELECT id, content, content_type, created_at, ocr_text
+               FROM clips
+               ORDER BY created_at DESC LIMIT 100";
+        pattern = String::new(); // unused in this branch, but needed to satisfy the type
+    }
+
+    let mut stmt = conn.prepare(sql).expect("Failed to prepare query");
+
+    let rows_iter = if search_query.is_some() {
+        stmt.query_map(rusqlite::params![pattern], row_to_clip)
+    } else {
+        stmt.query_map([], row_to_clip)
+    }.expect("Failed to run query");
+
+    rows_iter.filter_map(|r| r.ok()).collect()
+}
+
+fn row_to_clip(row: &rusqlite::Row) -> rusqlite::Result<ClipJson> {
+    Ok(ClipJson {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        content_type: row.get(2)?,
+        created_at: row.get(3)?,
+        ocr_text: row.get(4)?,
+    })
+}
+
+// --- CLI SEARCH (unchanged from before) ---
+
 fn run_search(conn: &Connection, query: &str) {
-    // SQL's LIKE is case-insensitive by default for ASCII in SQLite.
-    // We wrap the query in % wildcards to match it anywhere in the text.
     let pattern = format!("%{}%", query);
 
-    // prepare() compiles the SQL once; we then feed it parameters and iterate rows.
     let mut stmt = conn.prepare(
         "SELECT id, content, content_type, created_at, ocr_text
          FROM clips
@@ -53,15 +180,13 @@ fn run_search(conn: &Connection, query: &str) {
          ORDER BY created_at DESC"
     ).expect("Failed to prepare search query");
 
-    // query_map runs the query and lets us transform each row into a Rust value.
-    // Here we build a tuple of the columns we care about.
     let results = stmt.query_map(rusqlite::params![pattern], |row| {
         Ok((
-            row.get::<_, i64>(0)?,           // id
-            row.get::<_, String>(1)?,        // content
-            row.get::<_, String>(2)?,        // content_type
-            row.get::<_, String>(3)?,        // created_at
-            row.get::<_, Option<String>>(4)?, // ocr_text (might be NULL)
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     }).expect("Failed to run search query");
 
@@ -74,7 +199,6 @@ fn run_search(conn: &Connection, query: &str) {
 
         println!("[{}] ({}) {}", id, content_type, created_at);
         if content_type == "text" {
-            // Show a short preview instead of dumping potentially huge text.
             let preview: String = content.chars().take(100).collect();
             println!("  {}", preview);
         } else {
@@ -94,7 +218,8 @@ fn run_search(conn: &Connection, query: &str) {
     }
 }
 
-// This is your existing watcher loop, unchanged, just moved into its own function.
+// --- WATCHER (unchanged from before) ---
+
 fn run_watcher(conn: &Connection) {
     fs::create_dir_all("clip_images").expect("Failed to create clip_images folder");
 

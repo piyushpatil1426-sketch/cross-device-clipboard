@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Clipboard History</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #262b36;
+    --text: #e6e8ec;
+    --muted: #8a90a2;
+    --accent: #5b8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 24px 32px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  h1 {
+    margin: 0 0 12px;
+    font-size: 20px;
+    font-weight: 600;
+  }
+  #search {
+    width: 100%;
+    max-width: 480px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+  }
+  #search:focus { border-color: var(--accent); }
+  main {
+    padding: 20px 32px;
+    max-width: 900px;
+  }
+  .clip {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+  }
+  .clip-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .badge {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(91, 140, 255, 0.15);
+    color: var(--accent);
+  }
+  .timestamp {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .clip-text {
+    font-size: 14px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .clip-image {
+    max-width: 100%;
+    max-height: 300px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    display: block;
+    margin-bottom: 8px;
+  }
+  .ocr-label {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  #empty {
+    color: var(--muted);
+    padding: 40px 0;
+    text-align: center;
+    display: none;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Clipboard History</h1>
+  <input id="search" type="text" placeholder="Search everything you've copied...">
+</header>
+
+<main>
+  <div id="results"></div>
+  <div id="empty">No clips found.</div>
+</main>
+
+<script>
+const resultsEl = document.getElementById('results');
+const emptyEl = document.getElementById('empty');
+const searchEl = document.getElementById('search');
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function renderClips(clips) {
+  resultsEl.innerHTML = '';
+
+  if (clips.length === 0) {
+    emptyEl.style.display = 'block';
+    return;
+  }
+  emptyEl.style.display = 'none';
+
+  for (const clip of clips) {
+    const card = document.createElement('div');
+    card.className = 'clip';
+
+    let bodyHtml = '';
+
+    if (clip.content_type === 'image') {
+      bodyHtml += `<img class="clip-image" src="/${escapeHtml(clip.content)}">`;
+      if (clip.ocr_text) {
+        bodyHtml += `<div class="ocr-label">Extracted text</div>`;
+        bodyHtml += `<div class="clip-text">${escapeHtml(clip.ocr_text)}</div>`;
+      }
+    } else {
+      bodyHtml += `<div class="clip-text">${escapeHtml(clip.content)}</div>`;
+    }
+
+    card.innerHTML = `
+      <div class="clip-meta">
+        <span class="badge">${escapeHtml(clip.content_type)}</span>
+        <span class="timestamp">${escapeHtml(clip.created_at)}</span>
+      </div>
+      ${bodyHtml}
+    `;
+
+    resultsEl.appendChild(card);
+  }
+}
+
+async function loadClips() {
+  const res = await fetch('/api/clips');
+  const clips = await res.json();
+  renderClips(clips);
+}
+
+async function searchClips(query) {
+  const res = await fetch('/api/search?q=' + encodeURIComponent(query));
+  const clips = await res.json();
+  renderClips(clips);
+}
+
+let debounceTimer = null;
+searchEl.addEventListener('input', () => {
+  clearTimeout(debounceTimer);
+  const query = searchEl.value.trim();
+
+  debounceTimer = setTimeout(() => {
+    if (query === '') {
+      loadClips();
+    } else {
+      searchClips(query);
+    }
+  }, 250);
+});
+
+loadClips();
+</script>
+
+</body>
+</html>
