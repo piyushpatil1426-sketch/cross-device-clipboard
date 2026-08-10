@@ -147,9 +147,13 @@ function renderClips(clips) {
       bodyHtml += `<div class="clip-text">${escapeHtml(clip.content)}</div>`;
     }
 
+    const badgeLabel = (clip.content_type === 'text' && clip.language && clip.language !== 'text')
+      ? clip.language
+      : clip.content_type;
+
     card.innerHTML = `
       <div class="clip-meta">
-        <span class="badge">${escapeHtml(clip.content_type)}</span>
+        <span class="badge">${escapeHtml(badgeLabel)}</span>
         <span class="timestamp">${escapeHtml(clip.created_at)}</span>
       </div>
       ${bodyHtml}

@@ -10,9 +10,6 @@ use sha2::{Sha256, Digest};
 use tiny_http::{Server, Response, Header};
 use serde::Serialize;
 
-// This struct represents one clip as we'll send it to the browser as JSON.
-// `#[derive(Serialize)]` auto-generates the code to convert this into JSON —
-// without it, we'd have to hand-write that conversion ourselves.
 #[derive(Serialize)]
 struct ClipJson {
     id: i64,
@@ -20,6 +17,7 @@ struct ClipJson {
     content_type: String,
     created_at: String,
     ocr_text: Option<String>,
+    language: Option<String>,
 }
 
 fn main() {
@@ -35,7 +33,8 @@ fn main() {
             device_id   TEXT NOT NULL,
             created_at  TEXT NOT NULL,
             ocr_text    TEXT,
-            content_hash TEXT NOT NULL
+            content_hash TEXT NOT NULL,
+            language    TEXT
         )",
         [],
     ).expect("Failed to create table");
@@ -50,15 +49,50 @@ fn main() {
     }
 }
 
+// --- LANGUAGE DETECTION ---
+
+fn detect_language(content: &str) -> String {
+    let rules: &[(&str, &[&str])] = &[
+        ("python", &["def ", "import ", "elif ", "self.", "print(", "    return"]),
+        ("rust", &["fn ", "let mut", "impl ", "use std::", "->", "println!"]),
+        ("javascript", &["function ", "const ", "=>", "console.log", "let ", "require("]),
+        ("typescript", &["interface ", ": string", ": number", "export type"]),
+        ("java", &["public class", "public static void main", "System.out.println"]),
+        ("c", &["#include <stdio.h>", "int main(", "printf("]),
+        ("cpp", &["#include <iostream>", "std::", "cout <<"]),
+        ("csharp", &["using System;", "Console.WriteLine", "public class"]),
+        ("php", &["<?php", "$this->", "echo "]),
+        ("sql", &["SELECT ", "FROM ", "WHERE ", "INSERT INTO"]),
+        ("html", &["<!DOCTYPE", "<div", "<html"]),
+        ("css", &["{", "px;", "color:"]),
+        ("shell", &["#!/bin/bash", "#!/bin/sh", "echo $"]),
+        ("json", &["{\"", "\":", "null,"]),
+    ];
+
+    let mut best_language = "text";
+    let mut best_score = 0;
+
+    for (language, patterns) in rules {
+        let score = patterns.iter().filter(|p| content.contains(**p)).count();
+        if score > best_score {
+            best_score = score;
+            best_language = language;
+        }
+    }
+
+    if best_score >= 2 {
+        best_language.to_string()
+    } else {
+        "text".to_string()
+    }
+}
+
 // --- WEB SERVER ---
 
 fn run_server(conn: Connection) {
     let server = Server::http("127.0.0.1:8080").expect("Failed to start server");
     println!("Server running at http://127.0.0.1:8080");
 
-    // `server.incoming_requests()` blocks and waits for each incoming HTTP request,
-    // one at a time — this is a simple single-threaded server, which is fine for
-    // a local single-user tool like this.
     for request in server.incoming_requests() {
         let url = request.url().to_string();
 
@@ -67,7 +101,6 @@ fn run_server(conn: Connection) {
         } else if url.starts_with("/api/clips") {
             serve_clips_json(&conn, request, None);
         } else if url.starts_with("/api/search") {
-            // Extract the "q" parameter manually from something like "/api/search?q=hello"
             let query_param = url
                 .split('?')
                 .nth(1)
@@ -85,16 +118,11 @@ fn run_server(conn: Connection) {
     }
 }
 
-// A very small, dependency-free URL-decoder for the common cases (spaces as %20 or +).
-// Good enough for our search box; not a full RFC-compliant decoder.
 fn urlencoding_decode(s: &str) -> String {
     s.replace('+', " ").replace("%20", " ")
 }
 
 fn serve_html(request: tiny_http::Request) {
-    // include_str! embeds the file's contents into the compiled binary at
-    // COMPILE time (not read from disk at runtime). The path is relative to
-    // this source file's location.
     let html = include_str!("../static/index.html");
     let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
     let response = Response::from_string(html).with_header(header);
@@ -114,8 +142,6 @@ fn serve_clips_json(conn: &Connection, request: tiny_http::Request, search_query
 }
 
 fn serve_image_file(request: tiny_http::Request, url: &str) {
-    // url looks like "/clip_images/20260810_075408.png" — strip the leading slash
-    // to turn it into a relative file path we can open.
     let path = url.trim_start_matches('/');
 
     match fs::read(path) {
@@ -131,20 +157,19 @@ fn serve_image_file(request: tiny_http::Request, url: &str) {
     }
 }
 
-// Shared by both the plain "list everything" case and the "search" case.
 fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
     let (sql, pattern);
     if let Some(q) = search_query {
-        sql = "SELECT id, content, content_type, created_at, ocr_text
+        sql = "SELECT id, content, content_type, created_at, ocr_text, language
                FROM clips
                WHERE content LIKE ?1 OR ocr_text LIKE ?1
                ORDER BY created_at DESC LIMIT 100";
         pattern = format!("%{}%", q);
     } else {
-        sql = "SELECT id, content, content_type, created_at, ocr_text
+        sql = "SELECT id, content, content_type, created_at, ocr_text, language
                FROM clips
                ORDER BY created_at DESC LIMIT 100";
-        pattern = String::new(); // unused in this branch, but needed to satisfy the type
+        pattern = String::new();
     }
 
     let mut stmt = conn.prepare(sql).expect("Failed to prepare query");
@@ -165,16 +190,17 @@ fn row_to_clip(row: &rusqlite::Row) -> rusqlite::Result<ClipJson> {
         content_type: row.get(2)?,
         created_at: row.get(3)?,
         ocr_text: row.get(4)?,
+        language: row.get(5)?,
     })
 }
 
-// --- CLI SEARCH (unchanged from before) ---
+// --- CLI SEARCH ---
 
 fn run_search(conn: &Connection, query: &str) {
     let pattern = format!("%{}%", query);
 
     let mut stmt = conn.prepare(
-        "SELECT id, content, content_type, created_at, ocr_text
+        "SELECT id, content, content_type, created_at, ocr_text, language
          FROM clips
          WHERE content LIKE ?1 OR ocr_text LIKE ?1
          ORDER BY created_at DESC"
@@ -187,6 +213,7 @@ fn run_search(conn: &Connection, query: &str) {
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     }).expect("Failed to run search query");
 
@@ -194,10 +221,11 @@ fn run_search(conn: &Connection, query: &str) {
 
     let mut count = 0;
     for row in results {
-        let (id, content, content_type, created_at, ocr_text) = row.expect("Row error");
+        let (id, content, content_type, created_at, ocr_text, language) = row.expect("Row error");
         count += 1;
 
-        println!("[{}] ({}) {}", id, content_type, created_at);
+        let lang_label = language.unwrap_or_else(|| "text".to_string());
+        println!("[{}] ({} / {}) {}", id, content_type, lang_label, created_at);
         if content_type == "text" {
             let preview: String = content.chars().take(100).collect();
             println!("  {}", preview);
@@ -218,7 +246,7 @@ fn run_search(conn: &Connection, query: &str) {
     }
 }
 
-// --- WATCHER (unchanged from before) ---
+// --- WATCHER ---
 
 fn run_watcher(conn: &Connection) {
     fs::create_dir_all("clip_images").expect("Failed to create clip_images folder");
@@ -236,7 +264,8 @@ fn run_watcher(conn: &Connection) {
                 let hash = hash_bytes(current_text.as_bytes());
 
                 if hash != last_hash {
-                    save_clip_with_ocr(conn, &current_text, "text", None, &hash);
+                    let language = detect_language(&current_text);
+                    save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language);
                     last_hash = hash;
                     handled_this_tick = true;
                 }
@@ -262,7 +291,7 @@ fn run_watcher(conn: &Connection) {
 
                             let ocr_text = run_ocr(&filename);
 
-                            save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash);
+                            save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a");
                             last_hash = hash;
 
                             println!("Saved screenshot: {}", filename);
@@ -307,14 +336,15 @@ fn save_clip_with_ocr(
     content_type: &str,
     ocr_text: Option<&str>,
     content_hash: &str,
+    language: &str,
 ) {
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     conn.execute(
-        "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![content, content_type, "windows-pc", timestamp, ocr_text, content_hash],
+        "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash, language)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![content, content_type, "windows-pc", timestamp, ocr_text, content_hash, language],
     ).expect("Failed to insert clip");
 
-    println!("Saved {} clip at {}", content_type, timestamp);
+    println!("Saved {} clip ({}) at {}", content_type, language, timestamp);
 }
