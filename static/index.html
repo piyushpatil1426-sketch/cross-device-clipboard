@@ -28,9 +28,13 @@
     font-size: 20px;
     font-weight: 600;
   }
+  .controls {
+    display: flex;
+    gap: 10px;
+    max-width: 640px;
+  }
   #search {
-    width: 100%;
-    max-width: 480px;
+    flex: 1;
     padding: 10px 14px;
     background: var(--panel);
     border: 1px solid var(--border);
@@ -40,6 +44,15 @@
     outline: none;
   }
   #search:focus { border-color: var(--accent); }
+  #filter {
+    padding: 10px 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+  }
   main {
     padding: 20px 32px;
     max-width: 900px;
@@ -56,6 +69,11 @@
     justify-content: space-between;
     align-items: center;
     margin-bottom: 8px;
+  }
+  .meta-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .badge {
     font-size: 11px;
@@ -76,6 +94,21 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
+  .clip-text.collapsed {
+    max-height: 140px;
+    overflow: hidden;
+    position: relative;
+    mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
+    -webkit-mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
+  }
+  .toggle-link {
+    display: inline-block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--accent);
+    cursor: pointer;
+    user-select: none;
+  }
   .clip-image {
     max-width: 100%;
     max-height: 300px;
@@ -91,6 +124,19 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
+  .copy-btn {
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .copy-btn:hover {
+    color: var(--text);
+    border-color: var(--accent);
+  }
   #empty {
     color: var(--muted);
     padding: 40px 0;
@@ -103,7 +149,12 @@
 
 <header>
   <h1>Clipboard History</h1>
-  <input id="search" type="text" placeholder="Search everything you've copied...">
+  <div class="controls">
+    <input id="search" type="text" placeholder="Search everything you've copied...">
+    <select id="filter">
+      <option value="all">All types</option>
+    </select>
+  </div>
 </header>
 
 <main>
@@ -115,6 +166,12 @@
 const resultsEl = document.getElementById('results');
 const emptyEl = document.getElementById('empty');
 const searchEl = document.getElementById('search');
+const filterEl = document.getElementById('filter');
+
+// Holds whatever the server last returned, before client-side type filtering.
+let currentClips = [];
+
+const COLLAPSE_THRESHOLD = 500; // characters
 
 function escapeHtml(str) {
   const div = document.createElement('div');
@@ -122,42 +179,110 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+function badgeLabelFor(clip) {
+  if (clip.content_type === 'text' && clip.language && clip.language !== 'text') {
+    return clip.language;
+  }
+  return clip.content_type;
+}
+
+// Rebuilds the filter dropdown's options based on whatever badge labels
+// actually appear in the current result set, so it only ever shows
+// categories that are actually present.
+function updateFilterOptions(clips) {
+  const labels = new Set(clips.map(badgeLabelFor));
+  const previousValue = filterEl.value;
+
+  filterEl.innerHTML = '<option value="all">All types</option>';
+  for (const label of labels) {
+    const opt = document.createElement('option');
+    opt.value = label;
+    opt.textContent = label;
+    filterEl.appendChild(opt);
+  }
+
+  // Keep the user's previous filter selection if it's still a valid option.
+  if ([...labels, 'all'].includes(previousValue)) {
+    filterEl.value = previousValue;
+  }
+}
+
+function copyToClipboard(text, buttonEl) {
+  navigator.clipboard.writeText(text).then(() => {
+    const original = buttonEl.textContent;
+    buttonEl.textContent = 'Copied!';
+    setTimeout(() => { buttonEl.textContent = original; }, 1200);
+  });
+}
+
 function renderClips(clips) {
+  updateFilterOptions(clips);
+
+  const selectedFilter = filterEl.value;
+  const visibleClips = selectedFilter === 'all'
+    ? clips
+    : clips.filter(c => badgeLabelFor(c) === selectedFilter);
+
   resultsEl.innerHTML = '';
 
-  if (clips.length === 0) {
+  if (visibleClips.length === 0) {
     emptyEl.style.display = 'block';
     return;
   }
   emptyEl.style.display = 'none';
 
-  for (const clip of clips) {
+  for (const clip of visibleClips) {
     const card = document.createElement('div');
     card.className = 'clip';
+
+    const badgeLabel = badgeLabelFor(clip);
+
+    // The text we'd copy back to the clipboard if the user clicks Copy —
+    // for images, that's the OCR'd text (if any); for text clips, it's the content itself.
+    const copyableText = clip.content_type === 'image' ? (clip.ocr_text || '') : clip.content;
 
     let bodyHtml = '';
 
     if (clip.content_type === 'image') {
       bodyHtml += `<img class="clip-image" src="/${escapeHtml(clip.content)}">`;
       if (clip.ocr_text) {
+        const isLong = clip.ocr_text.length > COLLAPSE_THRESHOLD;
         bodyHtml += `<div class="ocr-label">Extracted text</div>`;
-        bodyHtml += `<div class="clip-text">${escapeHtml(clip.ocr_text)}</div>`;
+        bodyHtml += `<div class="clip-text ${isLong ? 'collapsed' : ''}">${escapeHtml(clip.ocr_text)}</div>`;
+        if (isLong) bodyHtml += `<div class="toggle-link">Show more</div>`;
       }
     } else {
-      bodyHtml += `<div class="clip-text">${escapeHtml(clip.content)}</div>`;
+      const isLong = clip.content.length > COLLAPSE_THRESHOLD;
+      bodyHtml += `<div class="clip-text ${isLong ? 'collapsed' : ''}">${escapeHtml(clip.content)}</div>`;
+      if (isLong) bodyHtml += `<div class="toggle-link">Show more</div>`;
     }
-
-    const badgeLabel = (clip.content_type === 'text' && clip.language && clip.language !== 'text')
-      ? clip.language
-      : clip.content_type;
 
     card.innerHTML = `
       <div class="clip-meta">
-        <span class="badge">${escapeHtml(badgeLabel)}</span>
-        <span class="timestamp">${escapeHtml(clip.created_at)}</span>
+        <div class="meta-left">
+          <span class="badge">${escapeHtml(badgeLabel)}</span>
+          <span class="timestamp">${escapeHtml(clip.created_at)}</span>
+        </div>
+        <button class="copy-btn">Copy</button>
       </div>
       ${bodyHtml}
     `;
+
+    // Wire up the Copy button for this specific card.
+    const copyBtn = card.querySelector('.copy-btn');
+    copyBtn.addEventListener('click', () => copyToClipboard(copyableText, copyBtn));
+
+    // Wire up the "Show more" / "Show less" toggle, if this card has one.
+    const toggleLink = card.querySelector('.toggle-link');
+    const textEl = card.querySelector('.clip-text');
+    if (toggleLink && textEl) {
+      toggleLink.addEventListener('click', () => {
+        const isCollapsed = textEl.classList.toggle('collapsed');
+        toggleLink.textContent = isCollapsed ? 'Show more' : 'Show less';
+      });
+      // Start in the expanded->collapsed state matching the class already set above.
+      toggleLink.textContent = textEl.classList.contains('collapsed') ? 'Show more' : 'Show less';
+    }
 
     resultsEl.appendChild(card);
   }
@@ -165,14 +290,14 @@ function renderClips(clips) {
 
 async function loadClips() {
   const res = await fetch('/api/clips');
-  const clips = await res.json();
-  renderClips(clips);
+  currentClips = await res.json();
+  renderClips(currentClips);
 }
 
 async function searchClips(query) {
   const res = await fetch('/api/search?q=' + encodeURIComponent(query));
-  const clips = await res.json();
-  renderClips(clips);
+  currentClips = await res.json();
+  renderClips(currentClips);
 }
 
 let debounceTimer = null;
@@ -187,6 +312,10 @@ searchEl.addEventListener('input', () => {
       searchClips(query);
     }
   }, 250);
+});
+
+filterEl.addEventListener('change', () => {
+  renderClips(currentClips);
 });
 
 loadClips();
