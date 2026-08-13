@@ -4,6 +4,7 @@ use std::thread;
 use std::time::Duration;
 use std::fs;
 use std::env;
+use std::process;
 use chrono::Local;
 use image::{RgbaImage, ImageFormat};
 use sha2::{Sha256, Digest};
@@ -23,9 +24,18 @@ struct ClipJson {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let conn = Connection::open("clipboard.db").expect("Failed to open database");
+    // Startup failures are fatal (the program genuinely can't run without a DB),
+    // but we print a clear message and exit cleanly instead of a raw Rust panic.
+    let conn = match Connection::open("clipboard.db") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: could not open clipboard.db ({e})");
+            eprintln!("Check that the folder is writable and no other program has it locked.");
+            process::exit(1);
+        }
+    };
 
-    conn.execute(
+    let create_result = conn.execute(
         "CREATE TABLE IF NOT EXISTS clips (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             content     TEXT NOT NULL,
@@ -37,7 +47,12 @@ fn main() {
             language    TEXT
         )",
         [],
-    ).expect("Failed to create table");
+    );
+
+    if let Err(e) = create_result {
+        eprintln!("Error: could not set up the database schema ({e})");
+        process::exit(1);
+    }
 
     if args.len() >= 3 && args[1] == "search" {
         let query = &args[2];
@@ -48,8 +63,6 @@ fn main() {
         run_watcher(&conn);
     }
 }
-
-// --- LANGUAGE DETECTION ---
 
 fn detect_language(content: &str) -> String {
     let rules: &[(&str, &[&str])] = &[
@@ -87,10 +100,17 @@ fn detect_language(content: &str) -> String {
     }
 }
 
-// --- WEB SERVER ---
 
 fn run_server(conn: Connection) {
-    let server = Server::http("127.0.0.1:8080").expect("Failed to start server");
+    let server = match Server::http("127.0.0.1:8080") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: could not start the web server ({e})");
+            eprintln!("Is port 8080 already in use? Maybe another instance is already running.");
+            process::exit(1);
+        }
+    };
+
     println!("Server running at http://127.0.0.1:8080");
 
     for request in server.incoming_requests() {
@@ -128,19 +148,25 @@ fn serve_html(request: tiny_http::Request) {
     let response = Response::from_string(html).with_header(header);
     let _ = request.respond(response);
 }
-
 fn serve_clips_json(conn: &Connection, request: tiny_http::Request, search_query: Option<String>) {
     let clips = match &search_query {
         Some(q) if !q.trim().is_empty() => fetch_clips(conn, Some(q)),
         _ => fetch_clips(conn, None),
     };
+    let json = match serde_json::to_string(&clips) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Warning: failed to serialize clips to JSON ({e})");
+            let response = Response::from_string("[]").with_status_code(500);
+            let _ = request.respond(response);
+            return;
+        }
+    };
 
-    let json = serde_json::to_string(&clips).expect("Failed to serialize clips");
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
     let response = Response::from_string(json).with_header(header);
     let _ = request.respond(response);
 }
-
 fn serve_image_file(request: tiny_http::Request, url: &str) {
     let path = url.trim_start_matches('/');
 
@@ -157,6 +183,8 @@ fn serve_image_file(request: tiny_http::Request, url: &str) {
     }
 }
 
+// Returns an empty list on failure instead of crashing the server —
+// a broken query shouldn't take down the whole daemon.
 fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
     let (sql, pattern);
     if let Some(q) = search_query {
@@ -172,15 +200,27 @@ fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
         pattern = String::new();
     }
 
-    let mut stmt = conn.prepare(sql).expect("Failed to prepare query");
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Warning: failed to prepare query ({e})");
+            return Vec::new();
+        }
+    };
 
     let rows_iter = if search_query.is_some() {
         stmt.query_map(rusqlite::params![pattern], row_to_clip)
     } else {
         stmt.query_map([], row_to_clip)
-    }.expect("Failed to run query");
+    };
 
-    rows_iter.filter_map(|r| r.ok()).collect()
+    match rows_iter {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("Warning: query failed ({e})");
+            Vec::new()
+        }
+    }
 }
 
 fn row_to_clip(row: &rusqlite::Row) -> rusqlite::Result<ClipJson> {
@@ -199,14 +239,19 @@ fn row_to_clip(row: &rusqlite::Row) -> rusqlite::Result<ClipJson> {
 fn run_search(conn: &Connection, query: &str) {
     let pattern = format!("%{}%", query);
 
-    let mut stmt = conn.prepare(
+    let mut stmt = match conn.prepare(
         "SELECT id, content, content_type, created_at, ocr_text, language
          FROM clips
          WHERE content LIKE ?1 OR ocr_text LIKE ?1
          ORDER BY created_at DESC"
-    ).expect("Failed to prepare search query");
-
-    let results = stmt.query_map(rusqlite::params![pattern], |row| {
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: search query failed to prepare ({e})");
+            return;
+        }
+    };
+    let results = match stmt.query_map(rusqlite::params![pattern], |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
@@ -215,13 +260,25 @@ fn run_search(conn: &Connection, query: &str) {
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
         ))
-    }).expect("Failed to run search query");
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: search failed to run ({e})");
+            return;
+        }
+    };
 
     println!("Search results for \"{}\":\n", query);
 
     let mut count = 0;
     for row in results {
-        let (id, content, content_type, created_at, ocr_text, language) = row.expect("Row error");
+        let (id, content, content_type, created_at, ocr_text, language) = match row {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Warning: skipping a row that failed to read ({e})");
+                continue;
+            }
+        };
         count += 1;
 
         let lang_label = language.unwrap_or_else(|| "text".to_string());
@@ -239,112 +296,146 @@ fn run_search(conn: &Connection, query: &str) {
         println!();
     }
 
-    if count == 0 {
+    if count==0 {
         println!("No matches found.");
     } else {
-        println!("{} match(es) found.", count);
+        println!("{}match(es) found.",count);
     }
 }
-
-// --- WATCHER ---
-
 fn run_watcher(conn: &Connection) {
-    fs::create_dir_all("clip_images").expect("Failed to create clip_images folder");
-
-    let mut clipboard = Clipboard::new().expect("Failed to access clipboard");
-    let mut last_hash = String::new();
-
+    if let Err(e) = fs::create_dir_all("clip_images") {
+        eprintln!("Error: could not create clip_images folder ({e})");
+        process::exit(1);
+    }
+    let mut clipboard=None;
+    for attempt in 1..=3 {
+        match Clipboard::new() {
+            Ok(cb) => {
+                clipboard=Some(cb);
+                break;
+            }
+            Err(e) => {
+                eprintln!("Warning: could not access clipboard (attempt {attempt}/3): {e}");
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+    let mut clipboard = match clipboard {
+        Some(cb)=>cb,
+        None=>{
+            eprintln!("Error: could not access the clipboard after 3 attempts. Giving up.");
+            process::exit(1);
+        }
+    };
+    let mut last_hash=String::new();
     println!("Clipboard watcher started. Writing to clipboard.db ...");
-
     loop {
-        let mut handled_this_tick = false;
-
-        if let Ok(current_text) = clipboard.get_text() {
-            if !current_text.is_empty() {
+        let mut handled_this_tick=false;
+        if let Ok(current_text)=clipboard.get_text() {
+            if !current_text.is_empty(){
                 let hash = hash_bytes(current_text.as_bytes());
-
-                if hash != last_hash {
-                    let language = detect_language(&current_text);
-                    save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language);
-                    last_hash = hash;
-                    handled_this_tick = true;
+                if hash != last_hash{
+                    let language=detect_language(&current_text);
+                    if save_clip_with_ocr(conn, &current_text,"text",None,&hash,&language) {
+                        last_hash=hash;
+                        handled_this_tick=true;
+                    }
                 }
             }
         }
+        if !handled_this_tick{
+            if let Ok(img_data)=clipboard.get_image() {
+                if !img_data.bytes.is_empty(){
+                    let hash=hash_bytes(&img_data.bytes);
+                    if hash!=last_hash{
+                        let width=img_data.width as u32;
+                        let height=img_data.height as u32;
+                        let buffer=RgbaImage::from_raw(width,height,img_data.bytes.into_owned());
 
-        if !handled_this_tick {
-            if let Ok(img_data) = clipboard.get_image() {
-                if !img_data.bytes.is_empty() {
-                    let hash = hash_bytes(&img_data.bytes);
+                        if let Some(img)=buffer{
+                            let timestamp=Local::now().format("%Y%m%d_%H%M%S").to_string();
+                            let filename=format!("clip_images/{}.png", timestamp);
 
-                    if hash != last_hash {
-                        let width = img_data.width as u32;
-                        let height = img_data.height as u32;
-                        let buffer = RgbaImage::from_raw(width, height, img_data.bytes.into_owned());
-
-                        if let Some(img) = buffer {
-                            let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-                            let filename = format!("clip_images/{}.png", timestamp);
-
-                            img.save_with_format(&filename, ImageFormat::Png)
-                                .expect("Failed to save image");
-
-                            let ocr_text = run_ocr(&filename);
-
-                            save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a");
-                            last_hash = hash;
-
-                            println!("Saved screenshot: {}", filename);
-                            if let Some(text) = &ocr_text {
-                                println!("OCR extracted {} chars", text.len());
+                            match img.save_with_format(&filename, ImageFormat::Png) {
+                                Ok(())=>{
+                                    let ocr_text = run_ocr(&filename);
+                                    if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a") {
+                                        last_hash=hash;
+                                        println!("Saved screenshot: {}", filename);
+                                        if let Some(text) = &ocr_text {
+                                            println!("OCR extracted {} chars", text.len());
+                                        }
+                                    }
+                                }
+                                Err(e)=>{
+                                    eprintln!("Warning: failed to save screenshot to {}({e})",filename);
+                                    last_hash = hash;
+                                }
                             }
+                        } else {
+                            eprintln!("Warning: clipboard image data didn't match its reported width/height, skipping.");
                         }
                     }
                 }
             }
         }
-
         thread::sleep(Duration::from_millis(500));
     }
 }
-
-fn hash_bytes(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
+fn hash_bytes(data: &[u8])->String {
+    let mut hasher=Sha256::new();
     hasher.update(data);
-    let result = hasher.finalize();
-    format!("{:x}", result)
+    let result=hasher.finalize();
+    format!("{:x}",result)
 }
 
-fn run_ocr(image_path: &str) -> Option<String> {
+fn run_ocr(image_path: &str)->Option<String> {
     use rusty_tesseract::{Image, Args};
 
-    let img = Image::from_path(image_path).ok()?;
-    let args = Args::default();
+    let img = match Image::from_path(image_path) {
+        Ok(i)=>i,
+        Err(e)=>{
+            eprintln!("Warning: OCR could not open image {} ({e})", image_path);
+            return None;
+        }
+    };
+    let args=Args::default();
 
     match rusty_tesseract::image_to_string(&img, &args) {
         Ok(text) => {
-            let trimmed = text.trim().to_string();
-            if trimmed.is_empty() { None } else { Some(trimmed) }
+            let trimmed=text.trim().to_string();
+            if trimmed.is_empty(){ None }else{ Some(trimmed) }
         }
-        Err(_) => None,
+        Err(e) => {
+            eprintln!("Warning: OCR failed on {} ({e}) — is Tesseract installed and on PATH?",image_path);
+            None
+        }
     }
 }
-
 fn save_clip_with_ocr(
-    conn: &Connection,
-    content: &str,
-    content_type: &str,
-    ocr_text: Option<&str>,
-    content_hash: &str,
-    language: &str,
-) {
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn:&Connection,
+    content:&str,
+    content_type:&str,
+    ocr_text:Option<&str>,
+    content_hash:&str,
+    language:&str,
+) -> bool {
+    let timestamp=Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    conn.execute(
+    let result = conn.execute(
         "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash, language)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![content, content_type, "windows-pc", timestamp, ocr_text, content_hash, language],
-    ).expect("Failed to insert clip");
+        rusqlite::params![content, content_type,"windows-pc",timestamp, ocr_text,content_hash,language],
+    );
 
-    println!("Saved {} clip ({}) at {}", content_type, language, timestamp);
+    match result {
+        Ok(_) => {
+            println!("Saved {} clip ({}) at {}", content_type, language, timestamp);
+            true
+        }
+        Err(e) => {
+            eprintln!("Error: failed to save clip to database ({e})");
+            false
+        }
+    }
 }

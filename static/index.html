@@ -168,7 +168,6 @@ const emptyEl = document.getElementById('empty');
 const searchEl = document.getElementById('search');
 const filterEl = document.getElementById('filter');
 
-// Holds whatever the server last returned, before client-side type filtering.
 let currentClips = [];
 
 const COLLAPSE_THRESHOLD = 500; // characters
@@ -185,10 +184,6 @@ function badgeLabelFor(clip) {
   }
   return clip.content_type;
 }
-
-// Rebuilds the filter dropdown's options based on whatever badge labels
-// actually appear in the current result set, so it only ever shows
-// categories that are actually present.
 function updateFilterOptions(clips) {
   const labels = new Set(clips.map(badgeLabelFor));
   const previousValue = filterEl.value;
@@ -201,7 +196,6 @@ function updateFilterOptions(clips) {
     filterEl.appendChild(opt);
   }
 
-  // Keep the user's previous filter selection if it's still a valid option.
   if ([...labels, 'all'].includes(previousValue)) {
     filterEl.value = previousValue;
   }
@@ -236,9 +230,6 @@ function renderClips(clips) {
     card.className = 'clip';
 
     const badgeLabel = badgeLabelFor(clip);
-
-    // The text we'd copy back to the clipboard if the user clicks Copy —
-    // for images, that's the OCR'd text (if any); for text clips, it's the content itself.
     const copyableText = clip.content_type === 'image' ? (clip.ocr_text || '') : clip.content;
 
     let bodyHtml = '';
@@ -268,11 +259,9 @@ function renderClips(clips) {
       ${bodyHtml}
     `;
 
-    // Wire up the Copy button for this specific card.
     const copyBtn = card.querySelector('.copy-btn');
     copyBtn.addEventListener('click', () => copyToClipboard(copyableText, copyBtn));
 
-    // Wire up the "Show more" / "Show less" toggle, if this card has one.
     const toggleLink = card.querySelector('.toggle-link');
     const textEl = card.querySelector('.clip-text');
     if (toggleLink && textEl) {
@@ -280,7 +269,6 @@ function renderClips(clips) {
         const isCollapsed = textEl.classList.toggle('collapsed');
         toggleLink.textContent = isCollapsed ? 'Show more' : 'Show less';
       });
-      // Start in the expanded->collapsed state matching the class already set above.
       toggleLink.textContent = textEl.classList.contains('collapsed') ? 'Show more' : 'Show less';
     }
 
