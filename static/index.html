@@ -11,6 +11,7 @@
     --text: #e6e8ec;
     --muted: #8a90a2;
     --accent: #5b8cff;
+    --highlight: rgba(255, 209, 91, 0.35);
   }
   * { box-sizing: border-box; }
   body {
@@ -20,13 +21,27 @@
     color: var(--text);
   }
   header {
-    padding: 24px 32px 16px;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    padding: 20px 32px 16px;
     border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .header-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 12px;
   }
   h1 {
-    margin: 0 0 12px;
+    margin: 0;
     font-size: 20px;
     font-weight: 600;
+  }
+  #count {
+    font-size: 12px;
+    color: var(--muted);
   }
   .controls {
     display: flex;
@@ -63,6 +78,10 @@
     border-radius: 10px;
     padding: 14px 16px;
     margin-bottom: 12px;
+    transition: border-color 0.15s ease;
+  }
+  .clip:hover {
+    border-color: #333a4a;
   }
   .clip-meta {
     display: flex;
@@ -84,9 +103,14 @@
     background: rgba(91, 140, 255, 0.15);
     color: var(--accent);
   }
+  .badge.code {
+    background: rgba(255, 209, 91, 0.15);
+    color: #ffd15b;
+  }
   .timestamp {
     font-size: 12px;
     color: var(--muted);
+    cursor: default;
   }
   .clip-text {
     font-size: 14px;
@@ -94,12 +118,25 @@
     white-space: pre-wrap;
     word-break: break-word;
   }
+  .clip-text.code {
+    font-family: 'Cascadia Code', 'Consolas', monospace;
+    font-size: 13px;
+    background: #0c0e13;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
   .clip-text.collapsed {
     max-height: 140px;
     overflow: hidden;
     position: relative;
     mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
     -webkit-mask-image: linear-gradient(to bottom, black 70%, transparent 100%);
+  }
+  mark {
+    background: var(--highlight);
+    color: inherit;
+    border-radius: 2px;
   }
   .toggle-link {
     display: inline-block;
@@ -148,9 +185,12 @@
 <body>
 
 <header>
-  <h1>Clipboard History</h1>
+  <div class="header-top">
+    <h1>Clipboard History</h1>
+    <span id="count"></span>
+  </div>
   <div class="controls">
-    <input id="search" type="text" placeholder="Search everything you've copied...">
+    <input id="search" type="text" placeholder="Search everything you've copied...  (press / to focus)">
     <select id="filter">
       <option value="all">All types</option>
     </select>
@@ -167,10 +207,17 @@ const resultsEl = document.getElementById('results');
 const emptyEl = document.getElementById('empty');
 const searchEl = document.getElementById('search');
 const filterEl = document.getElementById('filter');
+const countEl = document.getElementById('count');
 
 let currentClips = [];
+let currentQuery = '';
+const AUTO_REFRESH_MS = 4000;
+const COLLAPSE_THRESHOLD = 500;
 
-const COLLAPSE_THRESHOLD = 500; // characters
+const CODE_LANGUAGES = new Set([
+  'python','rust','javascript','typescript','java','c','cpp',
+  'csharp','php','sql','html','css','shell','json'
+]);
 
 function escapeHtml(str) {
   const div = document.createElement('div');
@@ -184,6 +231,37 @@ function badgeLabelFor(clip) {
   }
   return clip.content_type;
 }
+
+function isCodeClip(clip) {
+  return clip.content_type === 'text' && CODE_LANGUAGES.has(clip.language);
+}
+
+function relativeTime(timestampStr) {
+  const parsed = new Date(timestampStr.replace(' ', 'T'));
+  if (isNaN(parsed.getTime())) return timestampStr;
+
+  const diffMs = Date.now() - parsed.getTime();
+  const diffSec = Math.floor(diffMs / 1000);
+
+  if (diffSec < 5) return 'just now';
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay}d ago`;
+}
+
+function highlightMatches(text, query) {
+  const escaped = escapeHtml(text);
+  if (!query) return escaped;
+
+  const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(escapedQuery, 'gi');
+  return escaped.replace(re, (match) => `<mark>${match}</mark>`);
+}
+
 function updateFilterOptions(clips) {
   const labels = new Set(clips.map(badgeLabelFor));
   const previousValue = filterEl.value;
@@ -217,6 +295,8 @@ function renderClips(clips) {
     ? clips
     : clips.filter(c => badgeLabelFor(c) === selectedFilter);
 
+  countEl.textContent = clips.length === 1 ? '1 clip' : `${clips.length} clips`;
+
   resultsEl.innerHTML = '';
 
   if (visibleClips.length === 0) {
@@ -230,6 +310,7 @@ function renderClips(clips) {
     card.className = 'clip';
 
     const badgeLabel = badgeLabelFor(clip);
+    const isCode = isCodeClip(clip);
     const copyableText = clip.content_type === 'image' ? (clip.ocr_text || '') : clip.content;
 
     let bodyHtml = '';
@@ -238,21 +319,23 @@ function renderClips(clips) {
       bodyHtml += `<img class="clip-image" src="/${escapeHtml(clip.content)}">`;
       if (clip.ocr_text) {
         const isLong = clip.ocr_text.length > COLLAPSE_THRESHOLD;
+        const highlighted = highlightMatches(clip.ocr_text, currentQuery);
         bodyHtml += `<div class="ocr-label">Extracted text</div>`;
-        bodyHtml += `<div class="clip-text ${isLong ? 'collapsed' : ''}">${escapeHtml(clip.ocr_text)}</div>`;
+        bodyHtml += `<div class="clip-text ${isLong ? 'collapsed' : ''}">${highlighted}</div>`;
         if (isLong) bodyHtml += `<div class="toggle-link">Show more</div>`;
       }
     } else {
       const isLong = clip.content.length > COLLAPSE_THRESHOLD;
-      bodyHtml += `<div class="clip-text ${isLong ? 'collapsed' : ''}">${escapeHtml(clip.content)}</div>`;
+      const highlighted = highlightMatches(clip.content, currentQuery);
+      bodyHtml += `<div class="clip-text ${isCode ? 'code' : ''} ${isLong ? 'collapsed' : ''}">${highlighted}</div>`;
       if (isLong) bodyHtml += `<div class="toggle-link">Show more</div>`;
     }
 
     card.innerHTML = `
       <div class="clip-meta">
         <div class="meta-left">
-          <span class="badge">${escapeHtml(badgeLabel)}</span>
-          <span class="timestamp">${escapeHtml(clip.created_at)}</span>
+          <span class="badge ${isCode ? 'code' : ''}">${escapeHtml(badgeLabel)}</span>
+          <span class="timestamp" title="${escapeHtml(clip.created_at)}">${relativeTime(clip.created_at)}</span>
         </div>
         <button class="copy-btn">Copy</button>
       </div>
@@ -279,12 +362,14 @@ function renderClips(clips) {
 async function loadClips() {
   const res = await fetch('/api/clips');
   currentClips = await res.json();
+  currentQuery = '';
   renderClips(currentClips);
 }
 
 async function searchClips(query) {
   const res = await fetch('/api/search?q=' + encodeURIComponent(query));
   currentClips = await res.json();
+  currentQuery = query;
   renderClips(currentClips);
 }
 
@@ -305,6 +390,23 @@ searchEl.addEventListener('input', () => {
 filterEl.addEventListener('change', () => {
   renderClips(currentClips);
 });
+document.addEventListener('keydown', (e) => {
+  if (e.key === '/' && document.activeElement !== searchEl) {
+    e.preventDefault();
+    searchEl.focus();
+  }
+  if (e.key === 'Escape' && document.activeElement === searchEl) {
+    searchEl.value = '';
+    searchEl.blur();
+    loadClips();
+  }
+});
+
+setInterval(()=>{
+  if (searchEl.value.trim() === '') {
+    loadClips();
+  }
+}, AUTO_REFRESH_MS);
 
 loadClips();
 </script>

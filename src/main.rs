@@ -24,8 +24,25 @@ struct ClipJson {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Startup failures are fatal (the program genuinely can't run without a DB),
-    // but we print a clear message and exit cleanly instead of a raw Rust panic.
+    if args.len() >= 3 && args[1] == "search" {
+        let conn = open_db();
+        run_search(&conn, &args[2]);
+    } else if args.len() >= 2 && args[1] == "watch" {
+        let conn = open_db();
+        run_watcher(&conn);
+    } else if args.len() >= 2 && args[1] == "serve" {
+        let conn = open_db();
+        run_server(conn);
+    } else {
+        // Default: no arguments at all. Run the watcher AND the server together.
+        run_combined();
+    }
+}
+
+// Opens (or creates) the database and makes sure the table exists.
+// Shared by every mode, so each mode gets a correctly-initialized connection
+// without duplicating this setup code.
+fn open_db() -> Connection {
     let conn = match Connection::open("clipboard.db") {
         Ok(c) => c,
         Err(e) => {
@@ -54,15 +71,31 @@ fn main() {
         process::exit(1);
     }
 
-    if args.len() >= 3 && args[1] == "search" {
-        let query = &args[2];
-        run_search(&conn, query);
-    } else if args.len() >= 2 && args[1] == "serve" {
-        run_server(conn);
-    } else {
-        run_watcher(&conn);
-    }
+    conn
 }
+
+// Runs the watcher on a background thread and the server on the main thread,
+// so a single `cargo run` does everything.
+fn run_combined() {
+    println!("Starting clipboard capture + web UI together...");
+
+    // thread::spawn takes a closure that runs on a new OS thread.
+    // It needs to be 'static (own everything it uses) and Send (safe to move
+    // to another thread) — our closure satisfies both since it only opens
+    // its own fresh database connection inside itself, capturing nothing
+    // from the outside.
+    thread::spawn(|| {
+        let conn = open_db();
+        run_watcher(&conn);
+    });
+
+    // The server runs on the main thread and blocks here — this is fine,
+    // since the watcher is already running independently in the background.
+    let conn = open_db();
+    run_server(conn);
+}
+
+// --- LANGUAGE DETECTION ---
 
 fn detect_language(content: &str) -> String {
     let rules: &[(&str, &[&str])] = &[
@@ -100,6 +133,7 @@ fn detect_language(content: &str) -> String {
     }
 }
 
+// --- WEB SERVER ---
 
 fn run_server(conn: Connection) {
     let server = match Server::http("127.0.0.1:8080") {
@@ -148,11 +182,13 @@ fn serve_html(request: tiny_http::Request) {
     let response = Response::from_string(html).with_header(header);
     let _ = request.respond(response);
 }
+
 fn serve_clips_json(conn: &Connection, request: tiny_http::Request, search_query: Option<String>) {
     let clips = match &search_query {
         Some(q) if !q.trim().is_empty() => fetch_clips(conn, Some(q)),
         _ => fetch_clips(conn, None),
     };
+
     let json = match serde_json::to_string(&clips) {
         Ok(j) => j,
         Err(e) => {
@@ -167,6 +203,7 @@ fn serve_clips_json(conn: &Connection, request: tiny_http::Request, search_query
     let response = Response::from_string(json).with_header(header);
     let _ = request.respond(response);
 }
+
 fn serve_image_file(request: tiny_http::Request, url: &str) {
     let path = url.trim_start_matches('/');
 
@@ -183,8 +220,6 @@ fn serve_image_file(request: tiny_http::Request, url: &str) {
     }
 }
 
-// Returns an empty list on failure instead of crashing the server —
-// a broken query shouldn't take down the whole daemon.
 fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
     let (sql, pattern);
     if let Some(q) = search_query {
@@ -251,6 +286,7 @@ fn run_search(conn: &Connection, query: &str) {
             return;
         }
     };
+
     let results = match stmt.query_map(rusqlite::params![pattern], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -296,22 +332,26 @@ fn run_search(conn: &Connection, query: &str) {
         println!();
     }
 
-    if count==0 {
+    if count == 0 {
         println!("No matches found.");
     } else {
-        println!("{}match(es) found.",count);
+        println!("{} match(es) found.", count);
     }
 }
+
+// --- WATCHER ---
+
 fn run_watcher(conn: &Connection) {
     if let Err(e) = fs::create_dir_all("clip_images") {
         eprintln!("Error: could not create clip_images folder ({e})");
-        process::exit(1);
+        return;
     }
-    let mut clipboard=None;
+
+    let mut clipboard = None;
     for attempt in 1..=3 {
         match Clipboard::new() {
             Ok(cb) => {
-                clipboard=Some(cb);
+                clipboard = Some(cb);
                 break;
             }
             Err(e) => {
@@ -320,55 +360,64 @@ fn run_watcher(conn: &Connection) {
             }
         }
     }
+
     let mut clipboard = match clipboard {
-        Some(cb)=>cb,
-        None=>{
-            eprintln!("Error: could not access the clipboard after 3 attempts. Giving up.");
-            process::exit(1);
+        Some(cb) => cb,
+        None => {
+            eprintln!("Error: could not access the clipboard after 3 attempts. Watcher stopping.");
+            return;
         }
     };
-    let mut last_hash=String::new();
+
+    let mut last_hash = String::new();
+
     println!("Clipboard watcher started. Writing to clipboard.db ...");
+
     loop {
-        let mut handled_this_tick=false;
-        if let Ok(current_text)=clipboard.get_text() {
-            if !current_text.is_empty(){
+        let mut handled_this_tick = false;
+
+        if let Ok(current_text) = clipboard.get_text() {
+            if !current_text.is_empty() {
                 let hash = hash_bytes(current_text.as_bytes());
-                if hash != last_hash{
-                    let language=detect_language(&current_text);
-                    if save_clip_with_ocr(conn, &current_text,"text",None,&hash,&language) {
-                        last_hash=hash;
-                        handled_this_tick=true;
+
+                if hash != last_hash {
+                    let language = detect_language(&current_text);
+                    if save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language) {
+                        last_hash = hash;
+                        handled_this_tick = true;
                     }
                 }
             }
         }
-        if !handled_this_tick{
-            if let Ok(img_data)=clipboard.get_image() {
-                if !img_data.bytes.is_empty(){
-                    let hash=hash_bytes(&img_data.bytes);
-                    if hash!=last_hash{
-                        let width=img_data.width as u32;
-                        let height=img_data.height as u32;
-                        let buffer=RgbaImage::from_raw(width,height,img_data.bytes.into_owned());
 
-                        if let Some(img)=buffer{
-                            let timestamp=Local::now().format("%Y%m%d_%H%M%S").to_string();
-                            let filename=format!("clip_images/{}.png", timestamp);
+        if !handled_this_tick {
+            if let Ok(img_data) = clipboard.get_image() {
+                if !img_data.bytes.is_empty() {
+                    let hash = hash_bytes(&img_data.bytes);
+
+                    if hash != last_hash {
+                        let width = img_data.width as u32;
+                        let height = img_data.height as u32;
+                        let buffer = RgbaImage::from_raw(width, height, img_data.bytes.into_owned());
+
+                        if let Some(img) = buffer {
+                            let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+                            let filename = format!("clip_images/{}.png", timestamp);
 
                             match img.save_with_format(&filename, ImageFormat::Png) {
-                                Ok(())=>{
+                                Ok(()) => {
                                     let ocr_text = run_ocr(&filename);
+
                                     if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a") {
-                                        last_hash=hash;
+                                        last_hash = hash;
                                         println!("Saved screenshot: {}", filename);
                                         if let Some(text) = &ocr_text {
                                             println!("OCR extracted {} chars", text.len());
                                         }
                                     }
                                 }
-                                Err(e)=>{
-                                    eprintln!("Warning: failed to save screenshot to {}({e})",filename);
+                                Err(e) => {
+                                    eprintln!("Warning: failed to save screenshot to {} ({e})", filename);
                                     last_hash = hash;
                                 }
                             }
@@ -379,53 +428,56 @@ fn run_watcher(conn: &Connection) {
                 }
             }
         }
+
         thread::sleep(Duration::from_millis(500));
     }
 }
-fn hash_bytes(data: &[u8])->String {
-    let mut hasher=Sha256::new();
+
+fn hash_bytes(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
     hasher.update(data);
-    let result=hasher.finalize();
-    format!("{:x}",result)
+    let result = hasher.finalize();
+    format!("{:x}", result)
 }
 
-fn run_ocr(image_path: &str)->Option<String> {
+fn run_ocr(image_path: &str) -> Option<String> {
     use rusty_tesseract::{Image, Args};
 
     let img = match Image::from_path(image_path) {
-        Ok(i)=>i,
-        Err(e)=>{
+        Ok(i) => i,
+        Err(e) => {
             eprintln!("Warning: OCR could not open image {} ({e})", image_path);
             return None;
         }
     };
-    let args=Args::default();
+    let args = Args::default();
 
     match rusty_tesseract::image_to_string(&img, &args) {
         Ok(text) => {
-            let trimmed=text.trim().to_string();
-            if trimmed.is_empty(){ None }else{ Some(trimmed) }
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
         }
         Err(e) => {
-            eprintln!("Warning: OCR failed on {} ({e}) — is Tesseract installed and on PATH?",image_path);
+            eprintln!("Warning: OCR failed on {} ({e}) — is Tesseract installed and on PATH?", image_path);
             None
         }
     }
 }
+
 fn save_clip_with_ocr(
-    conn:&Connection,
-    content:&str,
-    content_type:&str,
-    ocr_text:Option<&str>,
-    content_hash:&str,
-    language:&str,
+    conn: &Connection,
+    content: &str,
+    content_type: &str,
+    ocr_text: Option<&str>,
+    content_hash: &str,
+    language: &str,
 ) -> bool {
-    let timestamp=Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let result = conn.execute(
         "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash, language)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![content, content_type,"windows-pc",timestamp, ocr_text,content_hash,language],
+        rusqlite::params![content, content_type, "windows-pc", timestamp, ocr_text, content_hash, language],
     );
 
     match result {
