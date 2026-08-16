@@ -34,14 +34,10 @@ fn main() {
         let conn = open_db();
         run_server(conn);
     } else {
-        // Default: no arguments at all. Run the watcher AND the server together.
         run_combined();
     }
 }
 
-// Opens (or creates) the database and makes sure the table exists.
-// Shared by every mode, so each mode gets a correctly-initialized connection
-// without duplicating this setup code.
 fn open_db() -> Connection {
     let conn = match Connection::open("clipboard.db") {
         Ok(c) => c,
@@ -74,29 +70,17 @@ fn open_db() -> Connection {
     conn
 }
 
-// Runs the watcher on a background thread and the server on the main thread,
-// so a single `cargo run` does everything.
 fn run_combined() {
     println!("Starting clipboard capture + web UI together...");
 
-    // thread::spawn takes a closure that runs on a new OS thread.
-    // It needs to be 'static (own everything it uses) and Send (safe to move
-    // to another thread) — our closure satisfies both since it only opens
-    // its own fresh database connection inside itself, capturing nothing
-    // from the outside.
     thread::spawn(|| {
         let conn = open_db();
         run_watcher(&conn);
     });
 
-    // The server runs on the main thread and blocks here — this is fine,
-    // since the watcher is already running independently in the background.
     let conn = open_db();
     run_server(conn);
 }
-
-// --- LANGUAGE DETECTION ---
-
 fn detect_language(content: &str) -> String {
     let rules: &[(&str, &[&str])] = &[
         ("python", &["def ", "import ", "elif ", "self.", "print(", "    return"]),
@@ -133,8 +117,6 @@ fn detect_language(content: &str) -> String {
     }
 }
 
-// --- WEB SERVER ---
-
 fn run_server(conn: Connection) {
     let server = match Server::http("127.0.0.1:8080") {
         Ok(s) => s,
@@ -152,6 +134,8 @@ fn run_server(conn: Connection) {
 
         if url == "/" || url == "/index.html" {
             serve_html(request);
+        } else if url.starts_with("/api/clips/") && *request.method() == tiny_http::Method::Delete {
+            delete_clip(&conn, request, &url);
         } else if url.starts_with("/api/clips") {
             serve_clips_json(&conn, request, None);
         } else if url.starts_with("/api/search") {
@@ -220,6 +204,53 @@ fn serve_image_file(request: tiny_http::Request, url: &str) {
     }
 }
 
+fn delete_clip(conn: &Connection, request: tiny_http::Request, url: &str) {
+    let id_str = url.trim_start_matches("/api/clips/");
+    let id: i64 = match id_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            let response = Response::from_string("Invalid clip id").with_status_code(400);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+    let row: Result<(String, String), _> = conn.query_row(
+        "SELECT content, content_type FROM clips WHERE id = ?1",
+        rusqlite::params![id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
+
+    let (content, content_type) = match row {
+        Ok(data) => data,
+        Err(_) => {
+            let response = Response::from_string("Clip not found").with_status_code(404);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    let delete_result = conn.execute("DELETE FROM clips WHERE id = ?1", rusqlite::params![id]);
+
+    match delete_result {
+        Ok(_) => {
+            if content_type == "image" {
+                if let Err(e) = fs::remove_file(&content) {
+                    eprintln!("Warning: could not delete image file {} ({e})", content);
+                }
+            }
+            println!("Deleted clip {}", id);
+            let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+            let response = Response::from_string("{\"status\":\"deleted\"}").with_header(header);
+            let _ = request.respond(response);
+        }
+        Err(e) => {
+            eprintln!("Error: failed to delete clip {} ({e})", id);
+            let response = Response::from_string("Failed to delete").with_status_code(500);
+            let _ = request.respond(response);
+        }
+    }
+}
+
 fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
     let (sql, pattern);
     if let Some(q) = search_query {
@@ -268,9 +299,6 @@ fn row_to_clip(row: &rusqlite::Row) -> rusqlite::Result<ClipJson> {
         language: row.get(5)?,
     })
 }
-
-// --- CLI SEARCH ---
-
 fn run_search(conn: &Connection, query: &str) {
     let pattern = format!("%{}%", query);
 
@@ -303,9 +331,7 @@ fn run_search(conn: &Connection, query: &str) {
             return;
         }
     };
-
     println!("Search results for \"{}\":\n", query);
-
     let mut count = 0;
     for row in results {
         let (id, content, content_type, created_at, ocr_text, language) = match row {
@@ -338,8 +364,6 @@ fn run_search(conn: &Connection, query: &str) {
         println!("{} match(es) found.", count);
     }
 }
-
-// --- WATCHER ---
 
 fn run_watcher(conn: &Connection) {
     if let Err(e) = fs::create_dir_all("clip_images") {
@@ -446,15 +470,15 @@ fn run_ocr(image_path: &str) -> Option<String> {
     let img = match Image::from_path(image_path) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("Warning: OCR could not open image {} ({e})", image_path);
+            eprintln!("Warning: OCR could not open image {}({e})", image_path);
             return None;
         }
     };
     let args = Args::default();
 
     match rusty_tesseract::image_to_string(&img, &args) {
-        Ok(text) => {
-            let trimmed = text.trim().to_string();
+        Ok(text) =>{
+            let trimmed =text.trim().to_string();
             if trimmed.is_empty() { None } else { Some(trimmed) }
         }
         Err(e) => {

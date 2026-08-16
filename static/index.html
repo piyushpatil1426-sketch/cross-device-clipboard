@@ -88,11 +88,18 @@
     justify-content: space-between;
     align-items: center;
     margin-bottom: 8px;
+    gap: 10px;
   }
   .meta-left {
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
+  }
+  .meta-right {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
   }
   .badge {
     font-size: 11px;
@@ -102,6 +109,7 @@
     border-radius: 999px;
     background: rgba(91, 140, 255, 0.15);
     color: var(--accent);
+    white-space: nowrap;
   }
   .badge.code {
     background: rgba(255, 209, 91, 0.15);
@@ -111,6 +119,7 @@
     font-size: 12px;
     color: var(--muted);
     cursor: default;
+    white-space: nowrap;
   }
   .clip-text {
     font-size: 14px;
@@ -169,10 +178,15 @@
     background: transparent;
     color: var(--muted);
     cursor: pointer;
+    white-space: nowrap;
   }
   .copy-btn:hover {
     color: var(--text);
     border-color: var(--accent);
+  }
+  .delete-btn:hover {
+    color: #ff6b6b;
+    border-color: #ff6b6b;
   }
   #empty {
     color: var(--muted);
@@ -213,6 +227,8 @@ let currentClips = [];
 let currentQuery = '';
 const AUTO_REFRESH_MS = 4000;
 const COLLAPSE_THRESHOLD = 500;
+
+const expandedIds = new Set();
 
 const CODE_LANGUAGES = new Set([
   'python','rust','javascript','typescript','java','c','cpp',
@@ -279,12 +295,55 @@ function updateFilterOptions(clips) {
   }
 }
 
-function copyToClipboard(text, buttonEl) {
-  navigator.clipboard.writeText(text).then(() => {
-    const original = buttonEl.textContent;
-    buttonEl.textContent = 'Copied!';
-    setTimeout(() => { buttonEl.textContent = original; }, 1200);
-  });
+function flashButton(buttonEl, message, revertAfterMs = 1200) {
+  const original = buttonEl.textContent;
+  buttonEl.textContent = message;
+  setTimeout(() => { buttonEl.textContent = original; }, revertAfterMs);
+}
+
+function copyTextToClipboard(text, buttonEl) {
+  navigator.clipboard.writeText(text)
+    .then(() => flashButton(buttonEl, 'Copied!'))
+    .catch(() => flashButton(buttonEl, 'Failed'));
+}
+
+async function copyImageToClipboard(imageUrl, buttonEl) {
+  try {
+    const response = await fetch(imageUrl);
+    const blob = await response.blob();
+    await navigator.clipboard.write([
+      new ClipboardItem({ [blob.type]: blob })
+    ]);
+    flashButton(buttonEl, 'Copied!');
+  } catch (err) {
+    console.error('Failed to copy image:', err);
+    flashButton(buttonEl, 'Failed');
+  }
+}
+
+// Sends DELETE /api/clips/{id} to the server, then removes the card from
+// the page immediately on success rather than waiting for the next auto-refresh.
+async function deleteClip(id, cardEl) {
+  const confirmed = confirm('Delete this clip? This cannot be undone.');
+  if (!confirmed) return;
+
+  try {
+    const res = await fetch(`/api/clips/${id}`, { method: 'DELETE' });
+    if (res.ok) {
+      cardEl.remove();
+      expandedIds.delete(id);
+      const remaining = resultsEl.querySelectorAll('.clip').length;
+      countEl.textContent = remaining === 1 ? '1 clip' : `${remaining} clips`;
+      if (remaining === 0) {
+        emptyEl.style.display = 'block';
+      }
+    } else {
+      alert('Failed to delete clip.');
+    }
+  } catch (err) {
+    console.error(err);
+    alert('Failed to delete clip.');
+  }
 }
 
 function renderClips(clips) {
@@ -311,25 +370,44 @@ function renderClips(clips) {
 
     const badgeLabel = badgeLabelFor(clip);
     const isCode = isCodeClip(clip);
-    const copyableText = clip.content_type === 'image' ? (clip.ocr_text || '') : clip.content;
+    const imageUrl = clip.content_type === 'image' ? `/${clip.content}` : null;
 
     let bodyHtml = '';
+    let textForToggle = '';
 
     if (clip.content_type === 'image') {
-      bodyHtml += `<img class="clip-image" src="/${escapeHtml(clip.content)}">`;
+      bodyHtml += `<img class="clip-image" src="${escapeHtml(imageUrl)}">`;
       if (clip.ocr_text) {
         const isLong = clip.ocr_text.length > COLLAPSE_THRESHOLD;
+        const startCollapsed = isLong && !expandedIds.has(clip.id);
         const highlighted = highlightMatches(clip.ocr_text, currentQuery);
+        textForToggle = clip.ocr_text;
         bodyHtml += `<div class="ocr-label">Extracted text</div>`;
-        bodyHtml += `<div class="clip-text ${isLong ? 'collapsed' : ''}">${highlighted}</div>`;
-        if (isLong) bodyHtml += `<div class="toggle-link">Show more</div>`;
+        bodyHtml += `<div class="clip-text ${startCollapsed ? 'collapsed' : ''}">${highlighted}</div>`;
+        if (isLong) bodyHtml += `<div class="toggle-link"></div>`;
       }
     } else {
       const isLong = clip.content.length > COLLAPSE_THRESHOLD;
+      const startCollapsed = isLong && !expandedIds.has(clip.id);
       const highlighted = highlightMatches(clip.content, currentQuery);
-      bodyHtml += `<div class="clip-text ${isCode ? 'code' : ''} ${isLong ? 'collapsed' : ''}">${highlighted}</div>`;
-      if (isLong) bodyHtml += `<div class="toggle-link">Show more</div>`;
+      textForToggle = clip.content;
+      bodyHtml += `<div class="clip-text ${isCode ? 'code' : ''} ${startCollapsed ? 'collapsed' : ''}">${highlighted}</div>`;
+      if (isLong) bodyHtml += `<div class="toggle-link"></div>`;
     }
+
+    // Build the action buttons for this card's top-right corner.
+    // Image clips get two copy buttons (image + text); text clips get one.
+    // Every card gets a Delete button.
+    let buttonsHtml = '';
+    if (clip.content_type === 'image') {
+      buttonsHtml += `<button class="copy-btn copy-image-btn">Copy Image</button>`;
+      if (clip.ocr_text) {
+        buttonsHtml += `<button class="copy-btn copy-text-btn">Copy Text</button>`;
+      }
+    } else {
+      buttonsHtml += `<button class="copy-btn copy-text-btn">Copy</button>`;
+    }
+    buttonsHtml += `<button class="copy-btn delete-btn" title="Delete this clip">Delete</button>`;
 
     card.innerHTML = `
       <div class="clip-meta">
@@ -337,22 +415,41 @@ function renderClips(clips) {
           <span class="badge ${isCode ? 'code' : ''}">${escapeHtml(badgeLabel)}</span>
           <span class="timestamp" title="${escapeHtml(clip.created_at)}">${relativeTime(clip.created_at)}</span>
         </div>
-        <button class="copy-btn">Copy</button>
+        <div class="meta-right">${buttonsHtml}</div>
       </div>
       ${bodyHtml}
     `;
 
-    const copyBtn = card.querySelector('.copy-btn');
-    copyBtn.addEventListener('click', () => copyToClipboard(copyableText, copyBtn));
+    const copyImageBtn = card.querySelector('.copy-image-btn');
+    if (copyImageBtn) {
+      copyImageBtn.addEventListener('click', () => copyImageToClipboard(imageUrl, copyImageBtn));
+    }
+    const copyTextBtn = card.querySelector('.copy-text-btn');
+    if (copyTextBtn) {
+      copyTextBtn.addEventListener('click', () => copyTextToClipboard(textForToggle, copyTextBtn));
+    }
+    const deleteBtn = card.querySelector('.delete-btn');
+    if (deleteBtn) {
+      deleteBtn.addEventListener('click', () => deleteClip(clip.id, card));
+    }
 
     const toggleLink = card.querySelector('.toggle-link');
     const textEl = card.querySelector('.clip-text');
     if (toggleLink && textEl) {
+      const syncLabel = () => {
+        toggleLink.textContent = textEl.classList.contains('collapsed') ? 'Show more' : 'Show less';
+      };
+      syncLabel();
+
       toggleLink.addEventListener('click', () => {
-        const isCollapsed = textEl.classList.toggle('collapsed');
-        toggleLink.textContent = isCollapsed ? 'Show more' : 'Show less';
+        const nowCollapsed = textEl.classList.toggle('collapsed');
+        if (nowCollapsed) {
+          expandedIds.delete(clip.id);
+        } else {
+          expandedIds.add(clip.id);
+        }
+        syncLabel();
       });
-      toggleLink.textContent = textEl.classList.contains('collapsed') ? 'Show more' : 'Show less';
     }
 
     resultsEl.appendChild(card);
@@ -390,6 +487,7 @@ searchEl.addEventListener('input', () => {
 filterEl.addEventListener('change', () => {
   renderClips(currentClips);
 });
+
 document.addEventListener('keydown', (e) => {
   if (e.key === '/' && document.activeElement !== searchEl) {
     e.preventDefault();
@@ -402,7 +500,7 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
-setInterval(()=>{
+setInterval(() => {
   if (searchEl.value.trim() === '') {
     loadClips();
   }
