@@ -5,6 +5,8 @@ use std::time::Duration;
 use std::fs;
 use std::env;
 use std::process;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Local;
 use image::{RgbaImage, ImageFormat};
 use sha2::{Sha256, Digest};
@@ -29,10 +31,12 @@ fn main() {
         run_search(&conn, &args[2]);
     } else if args.len() >= 2 && args[1] == "watch" {
         let conn = open_db();
-        run_watcher(&conn);
+        let paused = Arc::new(AtomicBool::new(false));
+        run_watcher(&conn, paused);
     } else if args.len() >= 2 && args[1] == "serve" {
         let conn = open_db();
-        run_server(conn);
+        let paused = Arc::new(AtomicBool::new(false));
+        run_server(conn, paused);
     } else {
         run_combined();
     }
@@ -69,18 +73,23 @@ fn open_db() -> Connection {
 
     conn
 }
-
 fn run_combined() {
     println!("Starting clipboard capture + web UI together...");
+    let paused = Arc::new(AtomicBool::new(false));
 
-    thread::spawn(|| {
+    let watcher_paused = Arc::clone(&paused);
+
+    thread::spawn(move || {
         let conn = open_db();
-        run_watcher(&conn);
+        run_watcher(&conn, watcher_paused);
     });
 
     let conn = open_db();
-    run_server(conn);
+    run_server(conn, paused);
 }
+
+// --- LANGUAGE DETECTION ---
+
 fn detect_language(content: &str) -> String {
     let rules: &[(&str, &[&str])] = &[
         ("python", &["def ", "import ", "elif ", "self.", "print(", "    return"]),
@@ -116,8 +125,7 @@ fn detect_language(content: &str) -> String {
         "text".to_string()
     }
 }
-
-fn run_server(conn: Connection) {
+fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
     let server = match Server::http("127.0.0.1:8080") {
         Ok(s) => s,
         Err(e) => {
@@ -126,15 +134,24 @@ fn run_server(conn: Connection) {
             process::exit(1);
         }
     };
-
     println!("Server running at http://127.0.0.1:8080");
-
     for request in server.incoming_requests() {
         let url = request.url().to_string();
+        let method = request.method().clone();
 
         if url == "/" || url == "/index.html" {
             serve_html(request);
-        } else if url.starts_with("/api/clips/") && *request.method() == tiny_http::Method::Delete {
+        } else if url == "/api/status" {
+            serve_status(&paused, request);
+        } else if url == "/api/pause" && method == tiny_http::Method::Post {
+            paused.store(true, Ordering::Relaxed);
+            println!("Capture paused.");
+            serve_status(&paused, request);
+        } else if url == "/api/resume" && method == tiny_http::Method::Post {
+            paused.store(false, Ordering::Relaxed);
+            println!("Capture resumed.");
+            serve_status(&paused, request);
+        } else if url.starts_with("/api/clips/") && method == tiny_http::Method::Delete {
             delete_clip(&conn, request, &url);
         } else if url.starts_with("/api/clips") {
             serve_clips_json(&conn, request, None);
@@ -155,24 +172,27 @@ fn run_server(conn: Connection) {
         }
     }
 }
-
+fn serve_status(paused: &Arc<AtomicBool>, request: tiny_http::Request) {
+    let is_paused = paused.load(Ordering::Relaxed);
+    let json = format!("{{\"paused\":{}}}", is_paused);
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = Response::from_string(json).with_header(header);
+    let _ = request.respond(response);
+}
 fn urlencoding_decode(s: &str) -> String {
     s.replace('+', " ").replace("%20", " ")
 }
-
 fn serve_html(request: tiny_http::Request) {
     let html = include_str!("../static/index.html");
     let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
     let response = Response::from_string(html).with_header(header);
     let _ = request.respond(response);
 }
-
 fn serve_clips_json(conn: &Connection, request: tiny_http::Request, search_query: Option<String>) {
     let clips = match &search_query {
         Some(q) if !q.trim().is_empty() => fetch_clips(conn, Some(q)),
         _ => fetch_clips(conn, None),
     };
-
     let json = match serde_json::to_string(&clips) {
         Ok(j) => j,
         Err(e) => {
@@ -214,6 +234,7 @@ fn delete_clip(conn: &Connection, request: tiny_http::Request, url: &str) {
             return;
         }
     };
+
     let row: Result<(String, String), _> = conn.query_row(
         "SELECT content, content_type FROM clips WHERE id = ?1",
         rusqlite::params![id],
@@ -299,6 +320,9 @@ fn row_to_clip(row: &rusqlite::Row) -> rusqlite::Result<ClipJson> {
         language: row.get(5)?,
     })
 }
+
+// --- CLI SEARCH ---
+
 fn run_search(conn: &Connection, query: &str) {
     let pattern = format!("%{}%", query);
 
@@ -331,7 +355,9 @@ fn run_search(conn: &Connection, query: &str) {
             return;
         }
     };
+
     println!("Search results for \"{}\":\n", query);
+
     let mut count = 0;
     for row in results {
         let (id, content, content_type, created_at, ocr_text, language) = match row {
@@ -364,8 +390,7 @@ fn run_search(conn: &Connection, query: &str) {
         println!("{} match(es) found.", count);
     }
 }
-
-fn run_watcher(conn: &Connection) {
+fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
     if let Err(e) = fs::create_dir_all("clip_images") {
         eprintln!("Error: could not create clip_images folder ({e})");
         return;
@@ -398,6 +423,11 @@ fn run_watcher(conn: &Connection) {
     println!("Clipboard watcher started. Writing to clipboard.db ...");
 
     loop {
+        if paused.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+
         let mut handled_this_tick = false;
 
         if let Ok(current_text) = clipboard.get_text() {
@@ -470,15 +500,15 @@ fn run_ocr(image_path: &str) -> Option<String> {
     let img = match Image::from_path(image_path) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("Warning: OCR could not open image {}({e})", image_path);
+            eprintln!("Warning: OCR could not open image {} ({e})", image_path);
             return None;
         }
     };
     let args = Args::default();
 
     match rusty_tesseract::image_to_string(&img, &args) {
-        Ok(text) =>{
-            let trimmed =text.trim().to_string();
+        Ok(text) => {
+            let trimmed = text.trim().to_string();
             if trimmed.is_empty() { None } else { Some(trimmed) }
         }
         Err(e) => {

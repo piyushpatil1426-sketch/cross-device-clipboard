@@ -170,6 +170,10 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
+  #pause-toggle.paused {
+  color: #ffd15b;
+  border-color: #ffd15b;
+  }
   .copy-btn {
     font-size: 11px;
     padding: 3px 10px;
@@ -201,7 +205,10 @@
 <header>
   <div class="header-top">
     <h1>Clipboard History</h1>
-    <span id="count"></span>
+    <div style="display:flex; align-items:center; gap:12px;">
+      <span id="count"></span>
+      <button id="pause-toggle" class="copy-btn">...</button>
+    </div>
   </div>
   <div class="controls">
     <input id="search" type="text" placeholder="Search everything you've copied...  (press / to focus)">
@@ -222,7 +229,28 @@ const emptyEl = document.getElementById('empty');
 const searchEl = document.getElementById('search');
 const filterEl = document.getElementById('filter');
 const countEl = document.getElementById('count');
+const pauseToggleEl = document.getElementById('pause-toggle');
 
+async function refreshStatus() {
+  const res = await fetch('/api/status');
+  const status = await res.json();
+  updatePauseButton(status.paused);
+}
+
+function updatePauseButton(isPaused) {
+  pauseToggleEl.textContent = isPaused ? '▶ Resume capture' : '⏸ Pause capture';
+  pauseToggleEl.classList.toggle('paused', isPaused);
+}
+
+pauseToggleEl.addEventListener('click', async () => {
+  const isCurrentlyPaused = pauseToggleEl.classList.contains('paused');
+  const endpoint = isCurrentlyPaused ? '/api/resume' : '/api/pause';
+  const res = await fetch(endpoint, { method: 'POST' });
+  const status = await res.json();
+  updatePauseButton(status.paused);
+});
+
+refreshStatus();
 let currentClips = [];
 let currentQuery = '';
 const AUTO_REFRESH_MS = 4000;
@@ -320,9 +348,6 @@ async function copyImageToClipboard(imageUrl, buttonEl) {
     flashButton(buttonEl, 'Failed');
   }
 }
-
-// Sends DELETE /api/clips/{id} to the server, then removes the card from
-// the page immediately on success rather than waiting for the next auto-refresh.
 async function deleteClip(id, cardEl) {
   const confirmed = confirm('Delete this clip? This cannot be undone.');
   if (!confirmed) return;
@@ -394,10 +419,6 @@ function renderClips(clips) {
       bodyHtml += `<div class="clip-text ${isCode ? 'code' : ''} ${startCollapsed ? 'collapsed' : ''}">${highlighted}</div>`;
       if (isLong) bodyHtml += `<div class="toggle-link"></div>`;
     }
-
-    // Build the action buttons for this card's top-right corner.
-    // Image clips get two copy buttons (image + text); text clips get one.
-    // Every card gets a Delete button.
     let buttonsHtml = '';
     if (clip.content_type === 'image') {
       buttonsHtml += `<button class="copy-btn copy-image-btn">Copy Image</button>`;
