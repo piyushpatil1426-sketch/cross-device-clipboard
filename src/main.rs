@@ -11,6 +11,7 @@ use chrono::Local;
 use image::{RgbaImage, ImageFormat};
 use sha2::{Sha256, Digest};
 use tiny_http::{Server, Response, Header};
+
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -73,11 +74,47 @@ fn open_db() -> Connection {
 
     conn
 }
+fn run_hotkey_listener() {
+    use device_query::{DeviceQuery, DeviceState, Keycode};
+
+    let device_state = DeviceState::new();
+    let mut was_pressed = false;
+
+    println!("Hotkey listener started. Press Ctrl+Alt+H to open the clipboard UI.");
+    loop {
+        let keys: Vec<Keycode> = device_state.get_keys();
+        let ctrl = keys.contains(&Keycode::LControl) || keys.contains(&Keycode::RControl);
+        let alt = keys.contains(&Keycode::LAlt) || keys.contains(&Keycode::RAlt);
+        let h_pressed = keys.contains(&Keycode::H);
+
+        let combo_pressed = ctrl && alt && h_pressed;
+
+        if combo_pressed && !was_pressed {
+            open_browser_to_ui();
+        }
+        was_pressed = combo_pressed;
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+fn open_browser_to_ui() {
+    println!("Hotkey pressed — opening clipboard UI...");
+    let result = process::Command::new("cmd")
+        .args(["/C", "start", "http://127.0.0.1:8080"])
+        .spawn();
+
+    if let Err(e) = result {
+        eprintln!("Warning: failed to open browser ({e})");
+    }
+}
 fn run_combined() {
     println!("Starting clipboard capture + web UI together...");
-    let paused = Arc::new(AtomicBool::new(false));
 
+    let paused = Arc::new(AtomicBool::new(false));
     let watcher_paused = Arc::clone(&paused);
+
+    thread::spawn(|| {
+        run_hotkey_listener();
+    });
 
     thread::spawn(move || {
         let conn = open_db();
@@ -87,9 +124,6 @@ fn run_combined() {
     let conn = open_db();
     run_server(conn, paused);
 }
-
-// --- LANGUAGE DETECTION ---
-
 fn detect_language(content: &str) -> String {
     let rules: &[(&str, &[&str])] = &[
         ("python", &["def ", "import ", "elif ", "self.", "print(", "    return"]),
