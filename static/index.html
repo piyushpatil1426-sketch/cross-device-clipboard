@@ -12,6 +12,7 @@
     --muted: #8a90a2;
     --accent: #5b8cff;
     --highlight: rgba(255, 209, 91, 0.35);
+    --warn: #ff9f43;
   }
   * { box-sizing: border-box; }
   body {
@@ -83,6 +84,10 @@
   .clip:hover {
     border-color: #333a4a;
   }
+  .clip.pinned {
+    border-color: rgba(91, 140, 255, 0.5);
+    background: linear-gradient(180deg, rgba(91,140,255,0.06), var(--panel) 40%);
+  }
   .clip-meta {
     display: flex;
     justify-content: space-between;
@@ -95,6 +100,7 @@
     align-items: center;
     gap: 8px;
     min-width: 0;
+    flex-wrap: wrap;
   }
   .meta-right {
     display: flex;
@@ -114,6 +120,10 @@
   .badge.code {
     background: rgba(255, 209, 91, 0.15);
     color: #ffd15b;
+  }
+  .badge.sensitive {
+    background: rgba(255, 159, 67, 0.15);
+    color: var(--warn);
   }
   .timestamp {
     font-size: 12px;
@@ -170,10 +180,6 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
-  #pause-toggle.paused {
-  color: #ffd15b;
-  border-color: #ffd15b;
-  }
   .copy-btn {
     font-size: 11px;
     padding: 3px 10px;
@@ -191,6 +197,24 @@
   .delete-btn:hover {
     color: #ff6b6b;
     border-color: #ff6b6b;
+  }
+  .pin-btn {
+    font-size: 14px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    line-height: 1;
+  }
+  .pin-btn.active {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .pin-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
   }
   #empty {
     color: var(--muted);
@@ -231,26 +255,6 @@ const filterEl = document.getElementById('filter');
 const countEl = document.getElementById('count');
 const pauseToggleEl = document.getElementById('pause-toggle');
 
-async function refreshStatus() {
-  const res = await fetch('/api/status');
-  const status = await res.json();
-  updatePauseButton(status.paused);
-}
-
-function updatePauseButton(isPaused) {
-  pauseToggleEl.textContent = isPaused ? '▶ Resume capture' : '⏸ Pause capture';
-  pauseToggleEl.classList.toggle('paused', isPaused);
-}
-
-pauseToggleEl.addEventListener('click', async () => {
-  const isCurrentlyPaused = pauseToggleEl.classList.contains('paused');
-  const endpoint = isCurrentlyPaused ? '/api/resume' : '/api/pause';
-  const res = await fetch(endpoint, { method: 'POST' });
-  const status = await res.json();
-  updatePauseButton(status.paused);
-});
-
-refreshStatus();
 let currentClips = [];
 let currentQuery = '';
 const AUTO_REFRESH_MS = 4000;
@@ -310,7 +314,7 @@ function updateFilterOptions(clips) {
   const labels = new Set(clips.map(badgeLabelFor));
   const previousValue = filterEl.value;
 
-  filterEl.innerHTML = '<option value="all">All types</option>';
+  filterEl.innerHTML = '<option value="all">All types</option><option value="pinned">Pinned</option>';
   for (const label of labels) {
     const opt = document.createElement('option');
     opt.value = label;
@@ -318,7 +322,7 @@ function updateFilterOptions(clips) {
     filterEl.appendChild(opt);
   }
 
-  if ([...labels, 'all'].includes(previousValue)) {
+  if ([...labels, 'all', 'pinned'].includes(previousValue)) {
     filterEl.value = previousValue;
   }
 }
@@ -348,6 +352,7 @@ async function copyImageToClipboard(imageUrl, buttonEl) {
     flashButton(buttonEl, 'Failed');
   }
 }
+
 async function deleteClip(id, cardEl) {
   const confirmed = confirm('Delete this clip? This cannot be undone.');
   if (!confirmed) return;
@@ -371,13 +376,36 @@ async function deleteClip(id, cardEl) {
   }
 }
 
+// Toggles the pinned state for a clip, then refreshes the whole list so
+// pinned/unpinned ordering (pinned items float to the top) stays correct.
+async function togglePin(id) {
+  try {
+    const res = await fetch(`/api/clips/${id}/toggle-pin`, { method: 'POST' });
+    if (res.ok) {
+      if (currentQuery) {
+        await searchClips(currentQuery);
+      } else {
+        await loadClips();
+      }
+    } else {
+      alert('Failed to update pin.');
+    }
+  } catch (err) {
+    console.error(err);
+    alert('Failed to update pin.');
+  }
+}
+
 function renderClips(clips) {
   updateFilterOptions(clips);
 
   const selectedFilter = filterEl.value;
-  const visibleClips = selectedFilter === 'all'
-    ? clips
-    : clips.filter(c => badgeLabelFor(c) === selectedFilter);
+  let visibleClips = clips;
+  if (selectedFilter === 'pinned') {
+    visibleClips = clips.filter(c => c.pinned);
+  } else if (selectedFilter !== 'all') {
+    visibleClips = clips.filter(c => badgeLabelFor(c) === selectedFilter);
+  }
 
   countEl.textContent = clips.length === 1 ? '1 clip' : `${clips.length} clips`;
 
@@ -391,7 +419,7 @@ function renderClips(clips) {
 
   for (const clip of visibleClips) {
     const card = document.createElement('div');
-    card.className = 'clip';
+    card.className = 'clip' + (clip.pinned ? ' pinned' : '');
 
     const badgeLabel = badgeLabelFor(clip);
     const isCode = isCodeClip(clip);
@@ -419,7 +447,9 @@ function renderClips(clips) {
       bodyHtml += `<div class="clip-text ${isCode ? 'code' : ''} ${startCollapsed ? 'collapsed' : ''}">${highlighted}</div>`;
       if (isLong) bodyHtml += `<div class="toggle-link"></div>`;
     }
+
     let buttonsHtml = '';
+    buttonsHtml += `<button class="pin-btn ${clip.pinned ? 'active' : ''}" title="${clip.pinned ? 'Unpin' : 'Pin'}">${clip.pinned ? '★' : '☆'}</button>`;
     if (clip.content_type === 'image') {
       buttonsHtml += `<button class="copy-btn copy-image-btn">Copy Image</button>`;
       if (clip.ocr_text) {
@@ -430,16 +460,24 @@ function renderClips(clips) {
     }
     buttonsHtml += `<button class="copy-btn delete-btn" title="Delete this clip">Delete</button>`;
 
+    const sensitiveBadge = clip.is_sensitive
+      ? `<span class="badge sensitive" title="This clip looks like it may contain a password, key, or token">⚠ Sensitive</span>`
+      : '';
+
     card.innerHTML = `
       <div class="clip-meta">
         <div class="meta-left">
           <span class="badge ${isCode ? 'code' : ''}">${escapeHtml(badgeLabel)}</span>
+          ${sensitiveBadge}
           <span class="timestamp" title="${escapeHtml(clip.created_at)}">${relativeTime(clip.created_at)}</span>
         </div>
         <div class="meta-right">${buttonsHtml}</div>
       </div>
       ${bodyHtml}
     `;
+
+    const pinBtn = card.querySelector('.pin-btn');
+    pinBtn.addEventListener('click', () => togglePin(clip.id));
 
     const copyImageBtn = card.querySelector('.copy-image-btn');
     if (copyImageBtn) {
@@ -520,6 +558,27 @@ document.addEventListener('keydown', (e) => {
     loadClips();
   }
 });
+
+async function refreshStatus() {
+  const res = await fetch('/api/status');
+  const status = await res.json();
+  updatePauseButton(status.paused);
+}
+
+function updatePauseButton(isPaused) {
+  pauseToggleEl.textContent = isPaused ? '▶ Resume capture' : '⏸ Pause capture';
+  pauseToggleEl.classList.toggle('paused', isPaused);
+}
+
+pauseToggleEl.addEventListener('click', async () => {
+  const isCurrentlyPaused = pauseToggleEl.classList.contains('paused');
+  const endpoint = isCurrentlyPaused ? '/api/resume' : '/api/pause';
+  const res = await fetch(endpoint, { method: 'POST' });
+  const status = await res.json();
+  updatePauseButton(status.paused);
+});
+
+refreshStatus();
 
 setInterval(() => {
   if (searchEl.value.trim() === '') {

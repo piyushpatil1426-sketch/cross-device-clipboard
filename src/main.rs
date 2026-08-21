@@ -11,7 +11,6 @@ use chrono::Local;
 use image::{RgbaImage, ImageFormat};
 use sha2::{Sha256, Digest};
 use tiny_http::{Server, Response, Header};
-
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -22,6 +21,8 @@ struct ClipJson {
     created_at: String,
     ocr_text: Option<String>,
     language: Option<String>,
+    pinned: bool,
+    is_sensitive: bool,
 }
 
 fn main() {
@@ -62,7 +63,9 @@ fn open_db() -> Connection {
             created_at  TEXT NOT NULL,
             ocr_text    TEXT,
             content_hash TEXT NOT NULL,
-            language    TEXT
+            language    TEXT,
+            pinned      INTEGER NOT NULL DEFAULT 0,
+            is_sensitive INTEGER NOT NULL DEFAULT 0
         )",
         [],
     );
@@ -74,38 +77,7 @@ fn open_db() -> Connection {
 
     conn
 }
-fn run_hotkey_listener() {
-    use device_query::{DeviceQuery, DeviceState, Keycode};
 
-    let device_state = DeviceState::new();
-    let mut was_pressed = false;
-
-    println!("Hotkey listener started. Press Ctrl+Alt+H to open the clipboard UI.");
-    loop {
-        let keys: Vec<Keycode> = device_state.get_keys();
-        let ctrl = keys.contains(&Keycode::LControl) || keys.contains(&Keycode::RControl);
-        let alt = keys.contains(&Keycode::LAlt) || keys.contains(&Keycode::RAlt);
-        let h_pressed = keys.contains(&Keycode::H);
-
-        let combo_pressed = ctrl && alt && h_pressed;
-
-        if combo_pressed && !was_pressed {
-            open_browser_to_ui();
-        }
-        was_pressed = combo_pressed;
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-fn open_browser_to_ui() {
-    println!("Hotkey pressed — opening clipboard UI...");
-    let result = process::Command::new("cmd")
-        .args(["/C", "start", "http://127.0.0.1:8080"])
-        .spawn();
-
-    if let Err(e) = result {
-        eprintln!("Warning: failed to open browser ({e})");
-    }
-}
 fn run_combined() {
     println!("Starting clipboard capture + web UI together...");
 
@@ -124,6 +96,48 @@ fn run_combined() {
     let conn = open_db();
     run_server(conn, paused);
 }
+
+// --- GLOBAL HOTKEY ---
+
+fn run_hotkey_listener() {
+    use device_query::{DeviceQuery, DeviceState, Keycode};
+
+    let device_state = DeviceState::new();
+    let mut was_pressed = false;
+
+    println!("Hotkey listener started. Press Ctrl+Alt+H to open the clipboard UI.");
+
+    loop {
+        let keys: Vec<Keycode> = device_state.get_keys();
+        let ctrl = keys.contains(&Keycode::LControl) || keys.contains(&Keycode::RControl);
+        let alt = keys.contains(&Keycode::LAlt) || keys.contains(&Keycode::RAlt);
+        let h_pressed = keys.contains(&Keycode::H);
+
+        let combo_pressed = ctrl && alt && h_pressed;
+
+        if combo_pressed && !was_pressed {
+            open_browser_to_ui();
+        }
+
+        was_pressed = combo_pressed;
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn open_browser_to_ui() {
+    println!("Hotkey pressed — opening clipboard UI...");
+    let result = process::Command::new("cmd")
+        .args(["/C", "start", "http://127.0.0.1:8080"])
+        .spawn();
+
+    if let Err(e) = result {
+        eprintln!("Warning: failed to open browser ({e})");
+    }
+}
+
+// --- LANGUAGE DETECTION ---
+
 fn detect_language(content: &str) -> String {
     let rules: &[(&str, &[&str])] = &[
         ("python", &["def ", "import ", "elif ", "self.", "print(", "    return"]),
@@ -159,6 +173,29 @@ fn detect_language(content: &str) -> String {
         "text".to_string()
     }
 }
+
+// --- SENSITIVE DATA DETECTION ---
+
+// Flags likely secrets (passwords, API keys, tokens, private keys) using
+// keyword/pattern matching — same lightweight heuristic style as language
+// detection. This only sets a warning badge; the clip is still captured
+// and shown normally, per the chosen scope.
+fn detect_sensitive(content: &str) -> bool {
+    let lower = content.to_lowercase();
+
+    let keywords = [
+        "password", "passwd", "pwd=", "pwd:",
+        "secret", "api_key", "apikey", "api-key",
+        "access_token", "auth_token", "client_secret",
+        "private_key", "-----begin", "bearer ",
+        "aws_secret", "akia",
+    ];
+
+    keywords.iter().any(|k| lower.contains(k))
+}
+
+// --- WEB SERVER ---
+
 fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
     let server = match Server::http("127.0.0.1:8080") {
         Ok(s) => s,
@@ -168,7 +205,9 @@ fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
             process::exit(1);
         }
     };
+
     println!("Server running at http://127.0.0.1:8080");
+
     for request in server.incoming_requests() {
         let url = request.url().to_string();
         let method = request.method().clone();
@@ -185,6 +224,8 @@ fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
             paused.store(false, Ordering::Relaxed);
             println!("Capture resumed.");
             serve_status(&paused, request);
+        } else if url.starts_with("/api/clips/") && url.ends_with("/toggle-pin") && method == tiny_http::Method::Post {
+            toggle_pin(&conn, request, &url);
         } else if url.starts_with("/api/clips/") && method == tiny_http::Method::Delete {
             delete_clip(&conn, request, &url);
         } else if url.starts_with("/api/clips") {
@@ -206,6 +247,7 @@ fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
         }
     }
 }
+
 fn serve_status(paused: &Arc<AtomicBool>, request: tiny_http::Request) {
     let is_paused = paused.load(Ordering::Relaxed);
     let json = format!("{{\"paused\":{}}}", is_paused);
@@ -213,20 +255,24 @@ fn serve_status(paused: &Arc<AtomicBool>, request: tiny_http::Request) {
     let response = Response::from_string(json).with_header(header);
     let _ = request.respond(response);
 }
+
 fn urlencoding_decode(s: &str) -> String {
     s.replace('+', " ").replace("%20", " ")
 }
+
 fn serve_html(request: tiny_http::Request) {
     let html = include_str!("../static/index.html");
     let header = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
     let response = Response::from_string(html).with_header(header);
     let _ = request.respond(response);
 }
+
 fn serve_clips_json(conn: &Connection, request: tiny_http::Request, search_query: Option<String>) {
     let clips = match &search_query {
         Some(q) if !q.trim().is_empty() => fetch_clips(conn, Some(q)),
         _ => fetch_clips(conn, None),
     };
+
     let json = match serde_json::to_string(&clips) {
         Ok(j) => j,
         Err(e) => {
@@ -306,18 +352,67 @@ fn delete_clip(conn: &Connection, request: tiny_http::Request, url: &str) {
     }
 }
 
+// Handles POST /api/clips/{id}/toggle-pin — flips the pinned flag and
+// returns the new state.
+fn toggle_pin(conn: &Connection, request: tiny_http::Request, url: &str) {
+    let trimmed = url.trim_start_matches("/api/clips/").trim_end_matches("/toggle-pin");
+    let id: i64 = match trimmed.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            let response = Response::from_string("Invalid clip id").with_status_code(400);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    let current: Result<bool, _> = conn.query_row(
+        "SELECT pinned FROM clips WHERE id = ?1",
+        rusqlite::params![id],
+        |r| r.get(0),
+    );
+
+    let current_pinned = match current {
+        Ok(v) => v,
+        Err(_) => {
+            let response = Response::from_string("Clip not found").with_status_code(404);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    let new_pinned = !current_pinned;
+    let update_result = conn.execute(
+        "UPDATE clips SET pinned = ?1 WHERE id = ?2",
+        rusqlite::params![new_pinned, id],
+    );
+
+    match update_result {
+        Ok(_) => {
+            let json = format!("{{\"pinned\":{}}}", new_pinned);
+            let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+            let response = Response::from_string(json).with_header(header);
+            let _ = request.respond(response);
+        }
+        Err(e) => {
+            eprintln!("Error: failed to toggle pin for clip {} ({e})", id);
+            let response = Response::from_string("Failed to update").with_status_code(500);
+            let _ = request.respond(response);
+        }
+    }
+}
+
 fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
     let (sql, pattern);
     if let Some(q) = search_query {
-        sql = "SELECT id, content, content_type, created_at, ocr_text, language
+        sql = "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive
                FROM clips
                WHERE content LIKE ?1 OR ocr_text LIKE ?1
-               ORDER BY created_at DESC LIMIT 100";
+               ORDER BY pinned DESC, created_at DESC LIMIT 100";
         pattern = format!("%{}%", q);
     } else {
-        sql = "SELECT id, content, content_type, created_at, ocr_text, language
+        sql = "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive
                FROM clips
-               ORDER BY created_at DESC LIMIT 100";
+               ORDER BY pinned DESC, created_at DESC LIMIT 100";
         pattern = String::new();
     }
 
@@ -352,6 +447,8 @@ fn row_to_clip(row: &rusqlite::Row) -> rusqlite::Result<ClipJson> {
         created_at: row.get(3)?,
         ocr_text: row.get(4)?,
         language: row.get(5)?,
+        pinned: row.get(6)?,
+        is_sensitive: row.get(7)?,
     })
 }
 
@@ -361,10 +458,10 @@ fn run_search(conn: &Connection, query: &str) {
     let pattern = format!("%{}%", query);
 
     let mut stmt = match conn.prepare(
-        "SELECT id, content, content_type, created_at, ocr_text, language
+        "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive
          FROM clips
          WHERE content LIKE ?1 OR ocr_text LIKE ?1
-         ORDER BY created_at DESC"
+         ORDER BY pinned DESC, created_at DESC"
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -381,6 +478,8 @@ fn run_search(conn: &Connection, query: &str) {
             row.get::<_, String>(3)?,
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
+            row.get::<_, bool>(6)?,
+            row.get::<_, bool>(7)?,
         ))
     }) {
         Ok(r) => r,
@@ -394,7 +493,7 @@ fn run_search(conn: &Connection, query: &str) {
 
     let mut count = 0;
     for row in results {
-        let (id, content, content_type, created_at, ocr_text, language) = match row {
+        let (id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive) = match row {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Warning: skipping a row that failed to read ({e})");
@@ -404,7 +503,12 @@ fn run_search(conn: &Connection, query: &str) {
         count += 1;
 
         let lang_label = language.unwrap_or_else(|| "text".to_string());
-        println!("[{}] ({} / {}) {}", id, content_type, lang_label, created_at);
+        let flags = format!(
+            "{}{}",
+            if pinned { " [pinned]" } else { "" },
+            if is_sensitive { " [sensitive]" } else { "" }
+        );
+        println!("[{}] ({} / {}){} {}", id, content_type, lang_label, flags, created_at);
         if content_type == "text" {
             let preview: String = content.chars().take(100).collect();
             println!("  {}", preview);
@@ -424,6 +528,9 @@ fn run_search(conn: &Connection, query: &str) {
         println!("{} match(es) found.", count);
     }
 }
+
+// --- WATCHER ---
+
 fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
     if let Err(e) = fs::create_dir_all("clip_images") {
         eprintln!("Error: could not create clip_images folder ({e})");
@@ -470,7 +577,8 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
 
                 if hash != last_hash {
                     let language = detect_language(&current_text);
-                    if save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language) {
+                    let is_sensitive = detect_sensitive(&current_text);
+                    if save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language, is_sensitive) {
                         last_hash = hash;
                         handled_this_tick = true;
                     }
@@ -495,8 +603,12 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
                             match img.save_with_format(&filename, ImageFormat::Png) {
                                 Ok(()) => {
                                     let ocr_text = run_ocr(&filename);
+                                    let is_sensitive = ocr_text
+                                        .as_deref()
+                                        .map(detect_sensitive)
+                                        .unwrap_or(false);
 
-                                    if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a") {
+                                    if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a", is_sensitive) {
                                         last_hash = hash;
                                         println!("Saved screenshot: {}", filename);
                                         if let Some(text) = &ocr_text {
@@ -559,18 +671,20 @@ fn save_clip_with_ocr(
     ocr_text: Option<&str>,
     content_hash: &str,
     language: &str,
+    is_sensitive: bool,
 ) -> bool {
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let result = conn.execute(
-        "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash, language)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![content, content_type, "windows-pc", timestamp, ocr_text, content_hash, language],
+        "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash, language, is_sensitive)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![content, content_type, "windows-pc", timestamp, ocr_text, content_hash, language, is_sensitive],
     );
 
     match result {
         Ok(_) => {
-            println!("Saved {} clip ({}) at {}", content_type, language, timestamp);
+            let flag = if is_sensitive { " [flagged as sensitive]" } else { "" };
+            println!("Saved {} clip ({}){} at {}", content_type, language, flag, timestamp);
             true
         }
         Err(e) => {
