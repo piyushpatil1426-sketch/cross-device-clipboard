@@ -1,3 +1,7 @@
+// In a release build, this suppresses the console window entirely (a real
+
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use arboard::Clipboard;
 use rusqlite::Connection;
 use std::thread;
@@ -7,6 +11,7 @@ use std::env;
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{self, Write};
 use chrono::Local;
 use image::{RgbaImage, ImageFormat};
 use sha2::{Sha256, Digest};
@@ -23,6 +28,26 @@ struct ClipJson {
     language: Option<String>,
     pinned: bool,
     is_sensitive: bool,
+}
+fn log_line(prefix: &str, msg: &str) {
+    let _ = writeln!(io::stdout(), "{}", msg);
+
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open("clipboard_daemon.log") {
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let _ = writeln!(file, "[{}] {} {}", timestamp, prefix, msg);
+    }
+}
+
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        log_line("INFO", &format!($($arg)*))
+    };
+}
+
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        log_line("WARN", &format!($($arg)*))
+    };
 }
 
 fn main() {
@@ -48,8 +73,8 @@ fn open_db() -> Connection {
     let conn = match Connection::open("clipboard.db") {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Error: could not open clipboard.db ({e})");
-            eprintln!("Check that the folder is writable and no other program has it locked.");
+            log_warn!("Error: could not open clipboard.db ({e})");
+            log_warn!("Check that the folder is writable and no other program has it locked.");
             process::exit(1);
         }
     };
@@ -71,7 +96,7 @@ fn open_db() -> Connection {
     );
 
     if let Err(e) = create_result {
-        eprintln!("Error: could not set up the database schema ({e})");
+        log_warn!("Error: could not set up the database schema ({e})");
         process::exit(1);
     }
 
@@ -79,7 +104,7 @@ fn open_db() -> Connection {
 }
 
 fn run_combined() {
-    println!("Starting clipboard capture + web UI together...");
+    log_info!("Starting clipboard capture + web UI together...");
 
     let paused = Arc::new(AtomicBool::new(false));
     let watcher_paused = Arc::clone(&paused);
@@ -97,15 +122,13 @@ fn run_combined() {
     run_server(conn, paused);
 }
 
-// --- GLOBAL HOTKEY ---
-
 fn run_hotkey_listener() {
     use device_query::{DeviceQuery, DeviceState, Keycode};
 
     let device_state = DeviceState::new();
     let mut was_pressed = false;
 
-    println!("Hotkey listener started. Press Ctrl+Alt+H to open the clipboard UI.");
+    log_info!("Hotkey listener started. Press Ctrl+Alt+H to open the clipboard UI.");
 
     loop {
         let keys: Vec<Keycode> = device_state.get_keys();
@@ -126,18 +149,15 @@ fn run_hotkey_listener() {
 }
 
 fn open_browser_to_ui() {
-    println!("Hotkey pressed — opening clipboard UI...");
+    log_info!("Hotkey pressed — opening clipboard UI...");
     let result = process::Command::new("cmd")
         .args(["/C", "start", "http://127.0.0.1:8080"])
         .spawn();
 
     if let Err(e) = result {
-        eprintln!("Warning: failed to open browser ({e})");
+        log_warn!("Warning: failed to open browser ({e})");
     }
 }
-
-// --- LANGUAGE DETECTION ---
-
 fn detect_language(content: &str) -> String {
     let rules: &[(&str, &[&str])] = &[
         ("python", &["def ", "import ", "elif ", "self.", "print(", "    return"]),
@@ -174,12 +194,6 @@ fn detect_language(content: &str) -> String {
     }
 }
 
-// --- SENSITIVE DATA DETECTION ---
-
-// Flags likely secrets (passwords, API keys, tokens, private keys) using
-// keyword/pattern matching — same lightweight heuristic style as language
-// detection. This only sets a warning badge; the clip is still captured
-// and shown normally, per the chosen scope.
 fn detect_sensitive(content: &str) -> bool {
     let lower = content.to_lowercase();
 
@@ -193,20 +207,17 @@ fn detect_sensitive(content: &str) -> bool {
 
     keywords.iter().any(|k| lower.contains(k))
 }
-
-// --- WEB SERVER ---
-
 fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
     let server = match Server::http("127.0.0.1:8080") {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error: could not start the web server ({e})");
-            eprintln!("Is port 8080 already in use? Maybe another instance is already running.");
+            log_warn!("Error: could not start the web server ({e})");
+            log_warn!("Is port 8080 already in use? Maybe another instance is already running.");
             process::exit(1);
         }
     };
 
-    println!("Server running at http://127.0.0.1:8080");
+    log_info!("Server running at http://127.0.0.1:8080");
 
     for request in server.incoming_requests() {
         let url = request.url().to_string();
@@ -218,11 +229,11 @@ fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
             serve_status(&paused, request);
         } else if url == "/api/pause" && method == tiny_http::Method::Post {
             paused.store(true, Ordering::Relaxed);
-            println!("Capture paused.");
+            log_info!("Capture paused.");
             serve_status(&paused, request);
         } else if url == "/api/resume" && method == tiny_http::Method::Post {
             paused.store(false, Ordering::Relaxed);
-            println!("Capture resumed.");
+            log_info!("Capture resumed.");
             serve_status(&paused, request);
         } else if url.starts_with("/api/clips/") && url.ends_with("/toggle-pin") && method == tiny_http::Method::Post {
             toggle_pin(&conn, request, &url);
@@ -276,7 +287,7 @@ fn serve_clips_json(conn: &Connection, request: tiny_http::Request, search_query
     let json = match serde_json::to_string(&clips) {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("Warning: failed to serialize clips to JSON ({e})");
+            log_warn!("Warning: failed to serialize clips to JSON ({e})");
             let response = Response::from_string("[]").with_status_code(500);
             let _ = request.respond(response);
             return;
@@ -336,24 +347,22 @@ fn delete_clip(conn: &Connection, request: tiny_http::Request, url: &str) {
         Ok(_) => {
             if content_type == "image" {
                 if let Err(e) = fs::remove_file(&content) {
-                    eprintln!("Warning: could not delete image file {} ({e})", content);
+                    log_warn!("Warning: could not delete image file {} ({e})", content);
                 }
             }
-            println!("Deleted clip {}", id);
+            log_info!("Deleted clip {}", id);
             let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
             let response = Response::from_string("{\"status\":\"deleted\"}").with_header(header);
             let _ = request.respond(response);
         }
         Err(e) => {
-            eprintln!("Error: failed to delete clip {} ({e})", id);
+            log_warn!("Error: failed to delete clip {} ({e})", id);
             let response = Response::from_string("Failed to delete").with_status_code(500);
             let _ = request.respond(response);
         }
     }
 }
 
-// Handles POST /api/clips/{id}/toggle-pin — flips the pinned flag and
-// returns the new state.
 fn toggle_pin(conn: &Connection, request: tiny_http::Request, url: &str) {
     let trimmed = url.trim_start_matches("/api/clips/").trim_end_matches("/toggle-pin");
     let id: i64 = match trimmed.parse() {
@@ -394,7 +403,7 @@ fn toggle_pin(conn: &Connection, request: tiny_http::Request, url: &str) {
             let _ = request.respond(response);
         }
         Err(e) => {
-            eprintln!("Error: failed to toggle pin for clip {} ({e})", id);
+            log_warn!("Error: failed to toggle pin for clip {} ({e})", id);
             let response = Response::from_string("Failed to update").with_status_code(500);
             let _ = request.respond(response);
         }
@@ -419,7 +428,7 @@ fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Warning: failed to prepare query ({e})");
+            log_warn!("Warning: failed to prepare query ({e})");
             return Vec::new();
         }
     };
@@ -433,7 +442,7 @@ fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
     match rows_iter {
         Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
         Err(e) => {
-            eprintln!("Warning: query failed ({e})");
+            log_warn!("Warning: query failed ({e})");
             Vec::new()
         }
     }
@@ -451,9 +460,6 @@ fn row_to_clip(row: &rusqlite::Row) -> rusqlite::Result<ClipJson> {
         is_sensitive: row.get(7)?,
     })
 }
-
-// --- CLI SEARCH ---
-
 fn run_search(conn: &Connection, query: &str) {
     let pattern = format!("%{}%", query);
 
@@ -465,7 +471,7 @@ fn run_search(conn: &Connection, query: &str) {
     ) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error: search query failed to prepare ({e})");
+            println!("Error: search query failed to prepare ({e})");
             return;
         }
     };
@@ -484,7 +490,7 @@ fn run_search(conn: &Connection, query: &str) {
     }) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Error: search failed to run ({e})");
+            println!("Error: search failed to run ({e})");
             return;
         }
     };
@@ -496,7 +502,7 @@ fn run_search(conn: &Connection, query: &str) {
         let (id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive) = match row {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Warning: skipping a row that failed to read ({e})");
+                println!("Warning: skipping a row that failed to read ({e})");
                 continue;
             }
         };
@@ -528,12 +534,9 @@ fn run_search(conn: &Connection, query: &str) {
         println!("{} match(es) found.", count);
     }
 }
-
-// --- WATCHER ---
-
 fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
     if let Err(e) = fs::create_dir_all("clip_images") {
-        eprintln!("Error: could not create clip_images folder ({e})");
+        log_warn!("Error: could not create clip_images folder ({e})");
         return;
     }
 
@@ -545,7 +548,7 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
                 break;
             }
             Err(e) => {
-                eprintln!("Warning: could not access clipboard (attempt {attempt}/3): {e}");
+                log_warn!("Warning: could not access clipboard (attempt {attempt}/3): {e}");
                 thread::sleep(Duration::from_millis(500));
             }
         }
@@ -554,14 +557,14 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
     let mut clipboard = match clipboard {
         Some(cb) => cb,
         None => {
-            eprintln!("Error: could not access the clipboard after 3 attempts. Watcher stopping.");
+            log_warn!("Error: could not access the clipboard after 3 attempts. Watcher stopping.");
             return;
         }
     };
 
     let mut last_hash = String::new();
 
-    println!("Clipboard watcher started. Writing to clipboard.db ...");
+    log_info!("Clipboard watcher started. Writing to clipboard.db ...");
 
     loop {
         if paused.load(Ordering::Relaxed) {
@@ -610,19 +613,19 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
 
                                     if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a", is_sensitive) {
                                         last_hash = hash;
-                                        println!("Saved screenshot: {}", filename);
+                                        log_info!("Saved screenshot: {}", filename);
                                         if let Some(text) = &ocr_text {
-                                            println!("OCR extracted {} chars", text.len());
+                                            log_info!("OCR extracted {} chars", text.len());
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("Warning: failed to save screenshot to {} ({e})", filename);
+                                    log_warn!("Warning: failed to save screenshot to {} ({e})", filename);
                                     last_hash = hash;
                                 }
                             }
                         } else {
-                            eprintln!("Warning: clipboard image data didn't match its reported width/height, skipping.");
+                            log_warn!("Warning: clipboard image data didn't match its reported width/height, skipping.");
                         }
                     }
                 }
@@ -646,7 +649,7 @@ fn run_ocr(image_path: &str) -> Option<String> {
     let img = match Image::from_path(image_path) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("Warning: OCR could not open image {} ({e})", image_path);
+            log_warn!("Warning: OCR could not open image {} ({e})", image_path);
             return None;
         }
     };
@@ -658,7 +661,7 @@ fn run_ocr(image_path: &str) -> Option<String> {
             if trimmed.is_empty() { None } else { Some(trimmed) }
         }
         Err(e) => {
-            eprintln!("Warning: OCR failed on {} ({e}) — is Tesseract installed and on PATH?", image_path);
+            log_warn!("Warning: OCR failed on {} ({e}) — is Tesseract installed and on PATH?", image_path);
             None
         }
     }
@@ -684,11 +687,11 @@ fn save_clip_with_ocr(
     match result {
         Ok(_) => {
             let flag = if is_sensitive { " [flagged as sensitive]" } else { "" };
-            println!("Saved {} clip ({}){} at {}", content_type, language, flag, timestamp);
+            log_info!("Saved {} clip ({}){} at {}", content_type, language, flag, timestamp);
             true
         }
         Err(e) => {
-            eprintln!("Error: failed to save clip to database ({e})");
+            log_warn!("Error: failed to save clip to database ({e})");
             false
         }
     }
