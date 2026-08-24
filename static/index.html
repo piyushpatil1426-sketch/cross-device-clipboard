@@ -73,6 +73,21 @@
     padding: 20px 32px;
     max-width: 900px;
   }
+  .session-group {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px;
+    margin-bottom: 12px;
+    background: rgba(91, 140, 255, 0.03);
+  }
+  .session-header {
+    font-size: 11px;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 8px;
+    padding-left: 4px;
+  }
   .clip {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -87,6 +102,13 @@
   .clip.pinned {
     border-color: rgba(91, 140, 255, 0.5);
     background: linear-gradient(180deg, rgba(91,140,255,0.06), var(--panel) 40%);
+  }
+  .clip.in-session {
+    margin-bottom: 8px;
+    border-color: rgba(91, 140, 255, 0.25);
+  }
+  .clip.in-session:last-child {
+    margin-bottom: 0;
   }
   .clip-meta {
     display: flex;
@@ -130,6 +152,16 @@
     color: var(--muted);
     cursor: default;
     white-space: nowrap;
+  }
+  .digest {
+    font-size: 12px;
+    color: var(--muted);
+    font-style: italic;
+    margin: 2px 0 8px;
+    padding: 6px 10px;
+    background: rgba(91, 140, 255, 0.06);
+    border-left: 2px solid var(--accent);
+    border-radius: 4px;
   }
   .clip-text {
     font-size: 14px;
@@ -259,6 +291,7 @@ let currentClips = [];
 let currentQuery = '';
 const AUTO_REFRESH_MS = 4000;
 const COLLAPSE_THRESHOLD = 500;
+const SESSION_GAP_MINUTES = 5;
 
 const expandedIds = new Set();
 
@@ -376,8 +409,6 @@ async function deleteClip(id, cardEl) {
   }
 }
 
-// Toggles the pinned state for a clip, then refreshes the whole list so
-// pinned/unpinned ordering (pinned items float to the top) stays correct.
 async function togglePin(id) {
   try {
     const res = await fetch(`/api/clips/${id}/toggle-pin`, { method: 'POST' });
@@ -394,6 +425,181 @@ async function togglePin(id) {
     console.error(err);
     alert('Failed to update pin.');
   }
+}
+
+function detectQuickActions(text) {
+  const actions = [];
+
+  const urlMatch = text.match(/https?:\/\/[^\s"'<>]+/);
+  if (urlMatch) {
+    actions.push({ label: '🔗 Open', action: () => window.open(urlMatch[0], '_blank') });
+  }
+
+  const emailMatch = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  if (emailMatch) {
+    actions.push({ label: '✉ Email', action: () => window.open(`mailto:${emailMatch[0]}`, '_blank') });
+  }
+
+  const phoneMatch = text.match(/(\+?\d[\d\s\-().]{6,}\d)/);
+  if (phoneMatch) {
+    const digitsOnly = phoneMatch[0].replace(/[^\d+]/g, '');
+    if (digitsOnly.replace(/\D/g, '').length >= 7) {
+      actions.push({ label: '📞 Call', action: () => window.open(`tel:${digitsOnly}`, '_blank') });
+    }
+  }
+
+  return actions;
+}
+
+// Groups consecutive, non-pinned clips whose timestamps are close together
+// into a "session" (e.g. an error message copied right before its fix).
+// Pinned clips always stand alone, since they're deliberately pulled out
+// of chronological order and grouping them by time wouldn't make sense.
+function groupIntoSessions(clips) {
+  const groups = [];
+  let currentGroup = null;
+
+  for (const clip of clips) {
+    if (clip.pinned) {
+      groups.push({ clips: [clip] });
+      currentGroup = null;
+      continue;
+    }
+
+    if (currentGroup) {
+      const prevClip = currentGroup.clips[currentGroup.clips.length - 1];
+      const prevTime = new Date(prevClip.created_at.replace(' ', 'T'));
+      const thisTime = new Date(clip.created_at.replace(' ', 'T'));
+      const diffMinutes = Math.abs(prevTime - thisTime) / 60000;
+
+      if (diffMinutes <= SESSION_GAP_MINUTES) {
+        currentGroup.clips.push(clip);
+        continue;
+      }
+    }
+
+    currentGroup = { clips: [clip] };
+    groups.push(currentGroup);
+  }
+
+  return groups;
+}
+
+// Builds a single clip's card element (all the content, badges, and button
+// wiring) without appending it anywhere — the caller decides where it goes,
+// which lets the same card-building logic be reused whether a clip is
+// standalone or part of a session group.
+function buildClipCard(clip) {
+  const card = document.createElement('div');
+  card.className = 'clip' + (clip.pinned ? ' pinned' : '');
+
+  const badgeLabel = badgeLabelFor(clip);
+  const isCode = isCodeClip(clip);
+  const imageUrl = clip.content_type === 'image' ? `/${clip.content}` : null;
+
+  let bodyHtml = '';
+  let textForToggle = '';
+
+  if (clip.content_type === 'image') {
+    bodyHtml += `<img class="clip-image" src="${escapeHtml(imageUrl)}">`;
+    if (clip.ocr_text) {
+      const isLong = clip.ocr_text.length > COLLAPSE_THRESHOLD;
+      const startCollapsed = isLong && !expandedIds.has(clip.id);
+      const highlighted = highlightMatches(clip.ocr_text, currentQuery);
+      textForToggle = clip.ocr_text;
+      bodyHtml += `<div class="ocr-label">Extracted text</div>`;
+      bodyHtml += `<div class="clip-text ${startCollapsed ? 'collapsed' : ''}">${highlighted}</div>`;
+      if (isLong) bodyHtml += `<div class="toggle-link"></div>`;
+    }
+  } else {
+    const isLong = clip.content.length > COLLAPSE_THRESHOLD;
+    const startCollapsed = isLong && !expandedIds.has(clip.id);
+    const highlighted = highlightMatches(clip.content, currentQuery);
+    textForToggle = clip.content;
+    bodyHtml += `<div class="clip-text ${isCode ? 'code' : ''} ${startCollapsed ? 'collapsed' : ''}">${highlighted}</div>`;
+    if (isLong) bodyHtml += `<div class="toggle-link"></div>`;
+  }
+
+  let buttonsHtml = '';
+  buttonsHtml += `<button class="pin-btn ${clip.pinned ? 'active' : ''}" title="${clip.pinned ? 'Unpin' : 'Pin'}">${clip.pinned ? '★' : '☆'}</button>`;
+  if (clip.content_type === 'image') {
+    buttonsHtml += `<button class="copy-btn copy-image-btn">Copy Image</button>`;
+    if (clip.ocr_text) {
+      buttonsHtml += `<button class="copy-btn copy-text-btn">Copy Text</button>`;
+    }
+  } else {
+    buttonsHtml += `<button class="copy-btn copy-text-btn">Copy</button>`;
+  }
+
+  const quickActions = detectQuickActions(textForToggle || '');
+  quickActions.forEach((qa, i) => {
+    buttonsHtml = `<button class="copy-btn quick-action-btn" data-action-index="${i}">${qa.label}</button>` + buttonsHtml;
+  });
+
+  buttonsHtml += `<button class="copy-btn delete-btn" title="Delete this clip">Delete</button>`;
+
+  const sensitiveBadge = clip.is_sensitive
+    ? `<span class="badge sensitive" title="This clip looks like it may contain a password, key, or token">⚠ Sensitive</span>`
+    : '';
+
+  const digestHtml = clip.digest
+    ? `<div class="digest">TL;DR: ${escapeHtml(clip.digest)}</div>`
+    : '';
+
+  card.innerHTML = `
+    <div class="clip-meta">
+      <div class="meta-left">
+        <span class="badge ${isCode ? 'code' : ''}">${escapeHtml(badgeLabel)}</span>
+        ${sensitiveBadge}
+        <span class="timestamp" title="${escapeHtml(clip.created_at)}">${relativeTime(clip.created_at)}</span>
+      </div>
+      <div class="meta-right">${buttonsHtml}</div>
+    </div>
+    ${digestHtml}
+    ${bodyHtml}
+  `;
+
+  const pinBtn = card.querySelector('.pin-btn');
+  pinBtn.addEventListener('click', () => togglePin(clip.id));
+
+  const copyImageBtn = card.querySelector('.copy-image-btn');
+  if (copyImageBtn) {
+    copyImageBtn.addEventListener('click', () => copyImageToClipboard(imageUrl, copyImageBtn));
+  }
+  const copyTextBtn = card.querySelector('.copy-text-btn');
+  if (copyTextBtn) {
+    copyTextBtn.addEventListener('click', () => copyTextToClipboard(textForToggle, copyTextBtn));
+  }
+  const deleteBtn = card.querySelector('.delete-btn');
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', () => deleteClip(clip.id, card));
+  }
+  const quickActionBtns = card.querySelectorAll('.quick-action-btn');
+  quickActionBtns.forEach((btn) => {
+    const index = parseInt(btn.dataset.actionIndex, 10);
+    btn.addEventListener('click', () => quickActions[index].action());
+  });
+
+  const toggleLink = card.querySelector('.toggle-link');
+  const textEl = card.querySelector('.clip-text');
+  if (toggleLink && textEl) {
+    const syncLabel = () => {
+      toggleLink.textContent = textEl.classList.contains('collapsed') ? 'Show more' : 'Show less';
+    };
+    syncLabel();
+
+    toggleLink.addEventListener('click', () => {
+      const nowCollapsed = textEl.classList.toggle('collapsed');
+      if (nowCollapsed) {
+        expandedIds.delete(clip.id);
+      } else {
+        expandedIds.add(clip.id);
+      }
+      syncLabel();
+    });
+  }
+
+  return card;
 }
 
 function renderClips(clips) {
@@ -417,101 +623,28 @@ function renderClips(clips) {
   }
   emptyEl.style.display = 'none';
 
-  for (const clip of visibleClips) {
-    const card = document.createElement('div');
-    card.className = 'clip' + (clip.pinned ? ' pinned' : '');
+  const sessionGroups = groupIntoSessions(visibleClips);
 
-    const badgeLabel = badgeLabelFor(clip);
-    const isCode = isCodeClip(clip);
-    const imageUrl = clip.content_type === 'image' ? `/${clip.content}` : null;
+  for (const group of sessionGroups) {
+    if (group.clips.length > 1) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'session-group';
 
-    let bodyHtml = '';
-    let textForToggle = '';
+      const header = document.createElement('div');
+      header.className = 'session-header';
+      header.textContent = `🧵 Session — ${group.clips.length} clips copied together`;
+      wrapper.appendChild(header);
 
-    if (clip.content_type === 'image') {
-      bodyHtml += `<img class="clip-image" src="${escapeHtml(imageUrl)}">`;
-      if (clip.ocr_text) {
-        const isLong = clip.ocr_text.length > COLLAPSE_THRESHOLD;
-        const startCollapsed = isLong && !expandedIds.has(clip.id);
-        const highlighted = highlightMatches(clip.ocr_text, currentQuery);
-        textForToggle = clip.ocr_text;
-        bodyHtml += `<div class="ocr-label">Extracted text</div>`;
-        bodyHtml += `<div class="clip-text ${startCollapsed ? 'collapsed' : ''}">${highlighted}</div>`;
-        if (isLong) bodyHtml += `<div class="toggle-link"></div>`;
+      for (const clip of group.clips) {
+        const card = buildClipCard(clip);
+        card.classList.add('in-session');
+        wrapper.appendChild(card);
       }
+
+      resultsEl.appendChild(wrapper);
     } else {
-      const isLong = clip.content.length > COLLAPSE_THRESHOLD;
-      const startCollapsed = isLong && !expandedIds.has(clip.id);
-      const highlighted = highlightMatches(clip.content, currentQuery);
-      textForToggle = clip.content;
-      bodyHtml += `<div class="clip-text ${isCode ? 'code' : ''} ${startCollapsed ? 'collapsed' : ''}">${highlighted}</div>`;
-      if (isLong) bodyHtml += `<div class="toggle-link"></div>`;
+      resultsEl.appendChild(buildClipCard(group.clips[0]));
     }
-
-    let buttonsHtml = '';
-    buttonsHtml += `<button class="pin-btn ${clip.pinned ? 'active' : ''}" title="${clip.pinned ? 'Unpin' : 'Pin'}">${clip.pinned ? '★' : '☆'}</button>`;
-    if (clip.content_type === 'image') {
-      buttonsHtml += `<button class="copy-btn copy-image-btn">Copy Image</button>`;
-      if (clip.ocr_text) {
-        buttonsHtml += `<button class="copy-btn copy-text-btn">Copy Text</button>`;
-      }
-    } else {
-      buttonsHtml += `<button class="copy-btn copy-text-btn">Copy</button>`;
-    }
-    buttonsHtml += `<button class="copy-btn delete-btn" title="Delete this clip">Delete</button>`;
-
-    const sensitiveBadge = clip.is_sensitive
-      ? `<span class="badge sensitive" title="This clip looks like it may contain a password, key, or token">⚠ Sensitive</span>`
-      : '';
-
-    card.innerHTML = `
-      <div class="clip-meta">
-        <div class="meta-left">
-          <span class="badge ${isCode ? 'code' : ''}">${escapeHtml(badgeLabel)}</span>
-          ${sensitiveBadge}
-          <span class="timestamp" title="${escapeHtml(clip.created_at)}">${relativeTime(clip.created_at)}</span>
-        </div>
-        <div class="meta-right">${buttonsHtml}</div>
-      </div>
-      ${bodyHtml}
-    `;
-
-    const pinBtn = card.querySelector('.pin-btn');
-    pinBtn.addEventListener('click', () => togglePin(clip.id));
-
-    const copyImageBtn = card.querySelector('.copy-image-btn');
-    if (copyImageBtn) {
-      copyImageBtn.addEventListener('click', () => copyImageToClipboard(imageUrl, copyImageBtn));
-    }
-    const copyTextBtn = card.querySelector('.copy-text-btn');
-    if (copyTextBtn) {
-      copyTextBtn.addEventListener('click', () => copyTextToClipboard(textForToggle, copyTextBtn));
-    }
-    const deleteBtn = card.querySelector('.delete-btn');
-    if (deleteBtn) {
-      deleteBtn.addEventListener('click', () => deleteClip(clip.id, card));
-    }
-
-    const toggleLink = card.querySelector('.toggle-link');
-    const textEl = card.querySelector('.clip-text');
-    if (toggleLink && textEl) {
-      const syncLabel = () => {
-        toggleLink.textContent = textEl.classList.contains('collapsed') ? 'Show more' : 'Show less';
-      };
-      syncLabel();
-
-      toggleLink.addEventListener('click', () => {
-        const nowCollapsed = textEl.classList.toggle('collapsed');
-        if (nowCollapsed) {
-          expandedIds.delete(clip.id);
-        } else {
-          expandedIds.add(clip.id);
-        }
-        syncLabel();
-      });
-    }
-
-    resultsEl.appendChild(card);
   }
 }
 

@@ -1,5 +1,3 @@
-// In a release build, this suppresses the console window entirely (a real
-
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use arboard::Clipboard;
@@ -12,6 +10,7 @@ use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{self, Write};
+use std::collections::{HashMap, HashSet};
 use chrono::Local;
 use image::{RgbaImage, ImageFormat};
 use sha2::{Sha256, Digest};
@@ -28,7 +27,11 @@ struct ClipJson {
     language: Option<String>,
     pinned: bool,
     is_sensitive: bool,
+    digest: Option<String>,
 }
+
+// --- LOGGING ---
+
 fn log_line(prefix: &str, msg: &str) {
     let _ = writeln!(io::stdout(), "{}", msg);
 
@@ -90,7 +93,8 @@ fn open_db() -> Connection {
             content_hash TEXT NOT NULL,
             language    TEXT,
             pinned      INTEGER NOT NULL DEFAULT 0,
-            is_sensitive INTEGER NOT NULL DEFAULT 0
+            is_sensitive INTEGER NOT NULL DEFAULT 0,
+            digest      TEXT
         )",
         [],
     );
@@ -121,6 +125,8 @@ fn run_combined() {
     let conn = open_db();
     run_server(conn, paused);
 }
+
+// --- GLOBAL HOTKEY ---
 
 fn run_hotkey_listener() {
     use device_query::{DeviceQuery, DeviceState, Keycode};
@@ -158,6 +164,9 @@ fn open_browser_to_ui() {
         log_warn!("Warning: failed to open browser ({e})");
     }
 }
+
+// --- LANGUAGE DETECTION ---
+
 fn detect_language(content: &str) -> String {
     let rules: &[(&str, &[&str])] = &[
         ("python", &["def ", "import ", "elif ", "self.", "print(", "    return"]),
@@ -194,6 +203,8 @@ fn detect_language(content: &str) -> String {
     }
 }
 
+// --- SENSITIVE DATA DETECTION ---
+
 fn detect_sensitive(content: &str) -> bool {
     let lower = content.to_lowercase();
 
@@ -207,6 +218,104 @@ fn detect_sensitive(content: &str) -> bool {
 
     keywords.iter().any(|k| lower.contains(k))
 }
+
+// --- DIGEST GENERATION (extractive summarization) ---
+//
+// Uses word-frequency scoring (a simplified version of Luhn's classic 1958
+// extractive summarization algorithm): split into sentences, count how often
+// each meaningful word appears across the whole text, then pick the sentence
+// whose words are, on average, the most frequent/important. This is a real,
+// well-established technique — not an LLM, but a principled local heuristic
+// requiring no external model.
+fn generate_digest(content: &str, language: &str) -> Option<String> {
+    let char_count = content.chars().count();
+    if char_count < 200 {
+        // Short enough to just read directly — a digest wouldn't add value.
+        return None;
+    }
+
+    // Code doesn't decompose into "sentences" meaningfully — give a
+    // structural summary instead.
+    if language != "text" && language != "n/a" {
+        let line_count = content.lines().count();
+        return Some(format!("{} lines of {} code", line_count, language));
+    }
+
+    let stopwords: HashSet<&str> = [
+        "the", "and", "for", "are", "but", "not", "you", "all", "can", "her",
+        "was", "one", "our", "out", "day", "get", "has", "him", "his", "how",
+        "man", "new", "now", "old", "see", "two", "way", "who", "boy", "did",
+        "its", "let", "put", "say", "she", "too", "use", "that", "with",
+        "this", "have", "from", "they", "will", "would", "there", "their",
+        "what", "about", "which", "when", "make", "like", "time", "just",
+        "into", "than", "then", "them", "these", "some", "could", "your",
+    ].into_iter().collect();
+
+    let sentences: Vec<&str> = content
+        .split(|c| c == '.' || c == '!' || c == '?' || c == '\n')
+        .map(|s| s.trim())
+        .filter(|s| s.len() > 15)
+        .collect();
+
+    if sentences.is_empty() {
+        return None;
+    }
+    if sentences.len() == 1 {
+        return Some(truncate_str(sentences[0], 140));
+    }
+
+    // Count how often each meaningful word appears across all sentences.
+    let mut word_freq: HashMap<String, u32> = HashMap::new();
+    for sentence in &sentences {
+        for word in sentence.split_whitespace() {
+            let cleaned: String = word.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect();
+            if cleaned.len() > 2 && !stopwords.contains(cleaned.as_str()) {
+                *word_freq.entry(cleaned).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Score each sentence by its words' combined frequency, normalized by
+    // sentence length so long sentences don't win purely by having more words.
+    let mut best_sentence = sentences[0];
+    let mut best_score = -1.0_f64;
+
+    for sentence in &sentences {
+        let words: Vec<String> = sentence.split_whitespace()
+            .map(|w| w.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect())
+            .filter(|w: &String| w.len() > 2)
+            .collect();
+
+        if words.is_empty() {
+            continue;
+        }
+
+        let raw_score: u32 = words.iter().map(|w| *word_freq.get(w).unwrap_or(&0)).sum();
+        let normalized = raw_score as f64 / (words.len() as f64).sqrt();
+
+        if normalized > best_score {
+            best_score = normalized;
+            best_sentence = sentence;
+        }
+    }
+
+    Some(truncate_str(best_sentence, 140))
+}
+
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated.trim_end())
+    }
+}
+
+// --- WEB SERVER ---
+
 fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
     let server = match Server::http("127.0.0.1:8080") {
         Ok(s) => s,
@@ -413,13 +522,13 @@ fn toggle_pin(conn: &Connection, request: tiny_http::Request, url: &str) {
 fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
     let (sql, pattern);
     if let Some(q) = search_query {
-        sql = "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive
+        sql = "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive, digest
                FROM clips
                WHERE content LIKE ?1 OR ocr_text LIKE ?1
                ORDER BY pinned DESC, created_at DESC LIMIT 100";
         pattern = format!("%{}%", q);
     } else {
-        sql = "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive
+        sql = "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive, digest
                FROM clips
                ORDER BY pinned DESC, created_at DESC LIMIT 100";
         pattern = String::new();
@@ -458,13 +567,17 @@ fn row_to_clip(row: &rusqlite::Row) -> rusqlite::Result<ClipJson> {
         language: row.get(5)?,
         pinned: row.get(6)?,
         is_sensitive: row.get(7)?,
+        digest: row.get(8)?,
     })
 }
+
+// --- CLI SEARCH ---
+
 fn run_search(conn: &Connection, query: &str) {
     let pattern = format!("%{}%", query);
 
     let mut stmt = match conn.prepare(
-        "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive
+        "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive, digest
          FROM clips
          WHERE content LIKE ?1 OR ocr_text LIKE ?1
          ORDER BY pinned DESC, created_at DESC"
@@ -486,6 +599,7 @@ fn run_search(conn: &Connection, query: &str) {
             row.get::<_, Option<String>>(5)?,
             row.get::<_, bool>(6)?,
             row.get::<_, bool>(7)?,
+            row.get::<_, Option<String>>(8)?,
         ))
     }) {
         Ok(r) => r,
@@ -499,7 +613,7 @@ fn run_search(conn: &Connection, query: &str) {
 
     let mut count = 0;
     for row in results {
-        let (id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive) = match row {
+        let (id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive, digest) = match row {
             Ok(r) => r,
             Err(e) => {
                 println!("Warning: skipping a row that failed to read ({e})");
@@ -515,6 +629,9 @@ fn run_search(conn: &Connection, query: &str) {
             if is_sensitive { " [sensitive]" } else { "" }
         );
         println!("[{}] ({} / {}){} {}", id, content_type, lang_label, flags, created_at);
+        if let Some(d) = &digest {
+            println!("  TL;DR: {}", d);
+        }
         if content_type == "text" {
             let preview: String = content.chars().take(100).collect();
             println!("  {}", preview);
@@ -534,6 +651,9 @@ fn run_search(conn: &Connection, query: &str) {
         println!("{} match(es) found.", count);
     }
 }
+
+// --- WATCHER ---
+
 fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
     if let Err(e) = fs::create_dir_all("clip_images") {
         log_warn!("Error: could not create clip_images folder ({e})");
@@ -581,7 +701,8 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
                 if hash != last_hash {
                     let language = detect_language(&current_text);
                     let is_sensitive = detect_sensitive(&current_text);
-                    if save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language, is_sensitive) {
+                    let digest = generate_digest(&current_text, &language);
+                    if save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language, is_sensitive, digest.as_deref()) {
                         last_hash = hash;
                         handled_this_tick = true;
                     }
@@ -610,8 +731,11 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
                                         .as_deref()
                                         .map(detect_sensitive)
                                         .unwrap_or(false);
+                                    let digest = ocr_text
+                                        .as_deref()
+                                        .and_then(|t| generate_digest(t, "text"));
 
-                                    if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a", is_sensitive) {
+                                    if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a", is_sensitive, digest.as_deref()) {
                                         last_hash = hash;
                                         log_info!("Saved screenshot: {}", filename);
                                         if let Some(text) = &ocr_text {
@@ -675,13 +799,14 @@ fn save_clip_with_ocr(
     content_hash: &str,
     language: &str,
     is_sensitive: bool,
+    digest: Option<&str>,
 ) -> bool {
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let result = conn.execute(
-        "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash, language, is_sensitive)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![content, content_type, "windows-pc", timestamp, ocr_text, content_hash, language, is_sensitive],
+        "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash, language, is_sensitive, digest)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![content, content_type, "windows-pc", timestamp, ocr_text, content_hash, language, is_sensitive, digest],
     );
 
     match result {
