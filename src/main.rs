@@ -324,14 +324,72 @@ fn sync_all_peers(device_id: &str, status_map: &SyncStatusMap) {
     }
 }
 
-fn notify_peers_of_new_clip() {
+// Tells every known peer "something changed on my end, pull it now" — used
+// after a new clip is captured, and (via notify_peer_to_pull) for the
+// bidirectional catch-up that runs at startup and right after pairing.
+fn notify_all_peers_to_pull() {
     thread::spawn(|| {
         let peer_list = load_peers();
         for peer in &peer_list.peers {
-            let url = format!("http://{}:{}/api/sync/notify", peer.ip, peer.port);
-            let _ = ureq::post(&url)
+            notify_peer_to_pull(peer);
+        }
+    });
+}
+
+fn notify_peer_to_pull(peer: &Peer) {
+    let url = format!("http://{}:{}/api/sync/notify", peer.ip, peer.port);
+    let _ = ureq::post(&url)
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .call();
+}
+
+// Pushes a deletion to every connected peer the instant it happens locally
+// (not on a timer, not on the next pull) so both devices stay identical
+// while the connection is active. Peers apply this by content_hash and do
+// NOT re-propagate it, so this never loops back and forth.
+fn propagate_delete_to_peers(content_hash: String) {
+    thread::spawn(move || {
+        let peer_list = load_peers();
+        for peer in &peer_list.peers {
+            let url = format!("http://{}:{}/api/sync/delete", peer.ip, peer.port);
+            let body = serde_json::json!({
+                "content_hash": content_hash,
+                "secret": peer.secret,
+            }).to_string();
+
+            let result = ureq::post(&url)
+                .set("Content-Type", "application/json")
                 .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-                .call();
+                .send_string(&body);
+
+            if let Err(e) = result {
+                log_warn!("Sync: failed to push delete to '{}' ({e})", peer.name);
+            }
+        }
+    });
+}
+
+// Pushes a pin/unpin the instant it happens locally, same reasoning as
+// propagate_delete_to_peers above.
+fn propagate_pin_to_peers(content_hash: String, pinned: bool) {
+    thread::spawn(move || {
+        let peer_list = load_peers();
+        for peer in &peer_list.peers {
+            let url = format!("http://{}:{}/api/sync/pin", peer.ip, peer.port);
+            let body = serde_json::json!({
+                "content_hash": content_hash,
+                "pinned": pinned,
+                "secret": peer.secret,
+            }).to_string();
+
+            let result = ureq::post(&url)
+                .set("Content-Type", "application/json")
+                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+                .send_string(&body);
+
+            if let Err(e) = result {
+                log_warn!("Sync: failed to push pin state to '{}' ({e})", peer.name);
+            }
         }
     });
 }
@@ -553,6 +611,11 @@ fn run_combined() {
     thread::spawn(move || {
         sync_all_peers(&sync_device_id, &sync_status_map);
     });
+    // Bidirectional catch-up: also tell every already-authorized peer to
+    // pull from us right now, in case we captured clips while they were
+    // offline. This is what makes "already connected" devices reconcile
+    // immediately instead of waiting for the next event on either side.
+    notify_all_peers_to_pull();
 
     let conn = open_db();
     run_server(conn, paused, device_config.secret, device_config.device_id, device_config.device_name, status_map, discovered, pending);
@@ -816,6 +879,10 @@ fn run_server(
             handle_remove_peer_request(request, &url);
         } else if url == "/api/sync/notify" && method == tiny_http::Method::Post {
             handle_sync_notify(request, my_device_id.clone(), Arc::clone(&status_map));
+        } else if url == "/api/sync/delete" && method == tiny_http::Method::Post {
+            handle_sync_delete_request(&conn, &my_secret, request);
+        } else if url == "/api/sync/pin" && method == tiny_http::Method::Post {
+            handle_sync_pin_request(&conn, &my_secret, request);
         } else if url.starts_with("/api/sync/pull") {
             serve_sync_pull(&conn, &my_secret, request, &url);
         } else if url.starts_with("/api/clips/") && url.ends_with("/toggle-pin") && method == tiny_http::Method::Post {
@@ -1027,6 +1094,9 @@ fn handle_pairing_respond(mut request: tiny_http::Request, url: &str, pending: &
         let peer_list = load_peers();
         if let Some(peer) = peer_list.peers.iter().find(|p| p.name == req.device_name) {
             sync_with_peer(conn, peer, my_device_id, status_map);
+            // Bidirectional: also tell them to pull from us right now, so
+            // both sides are caught up the moment the connection is live.
+            notify_peer_to_pull(peer);
         }
     } else {
         log_info!("Pairing: declined connection request from '{}'", req.device_name);
@@ -1067,6 +1137,8 @@ fn handle_pairing_complete(mut request: tiny_http::Request, my_device_id: &str, 
                 let peer_list = load_peers();
                 if let Some(peer) = peer_list.peers.iter().find(|p| p.name == resp.device_name) {
                     sync_with_peer(conn, peer, my_device_id, status_map);
+                    // Bidirectional: tell them to pull from us too.
+                    notify_peer_to_pull(peer);
                 }
             }
             let response = Response::from_string("{\"status\":\"ok\"}");
@@ -1086,6 +1158,106 @@ fn handle_sync_notify(request: tiny_http::Request, device_id: String, status_map
     });
 
     let response = Response::from_string("{\"status\":\"triggered\"}");
+    let _ = request.respond(response);
+}
+
+#[derive(Deserialize)]
+struct SyncDeleteBody {
+    content_hash: String,
+    secret: String,
+}
+
+// A peer just deleted a clip on their end and is pushing that deletion to us
+// live. We remove it locally by content_hash and deliberately do NOT
+// re-propagate — that would ping-pong the delete back and forth forever.
+fn handle_sync_delete_request(conn: &Connection, my_secret: &str, mut request: tiny_http::Request) {
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        let response = Response::from_string("Bad request").with_status_code(400);
+        let _ = request.respond(response);
+        return;
+    }
+
+    let parsed = match serde_json::from_str::<SyncDeleteBody>(&body) {
+        Ok(b) => b,
+        Err(_) => {
+            let response = Response::from_string("Bad request").with_status_code(400);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    if parsed.secret != my_secret {
+        log_warn!("Sync: rejected a delete push with an invalid secret");
+        let response = Response::from_string("Unauthorized").with_status_code(401);
+        let _ = request.respond(response);
+        return;
+    }
+
+    let row: Result<(String, String), _> = conn.query_row(
+        "SELECT content, content_type FROM clips WHERE content_hash = ?1",
+        rusqlite::params![parsed.content_hash],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
+
+    // If we don't have this clip (already deleted, or it never synced to
+    // us), there's nothing to do — that's not an error.
+    if let Ok((content, content_type)) = row {
+        let _ = conn.execute(
+            "DELETE FROM clips WHERE content_hash = ?1",
+            rusqlite::params![parsed.content_hash],
+        );
+        if content_type == "image" {
+            if let Err(e) = fs::remove_file(&content) {
+                log_warn!("Warning: could not delete synced image file {} ({e})", content);
+            }
+        }
+        log_info!("Sync: removed a clip deleted on a peer");
+    }
+
+    let response = Response::from_string("{\"status\":\"ok\"}");
+    let _ = request.respond(response);
+}
+
+#[derive(Deserialize)]
+struct SyncPinBody {
+    content_hash: String,
+    pinned: bool,
+    secret: String,
+}
+
+// Mirrors handle_sync_delete_request but for pin state. Same rule: apply
+// locally, never re-propagate.
+fn handle_sync_pin_request(conn: &Connection, my_secret: &str, mut request: tiny_http::Request) {
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        let response = Response::from_string("Bad request").with_status_code(400);
+        let _ = request.respond(response);
+        return;
+    }
+
+    let parsed = match serde_json::from_str::<SyncPinBody>(&body) {
+        Ok(b) => b,
+        Err(_) => {
+            let response = Response::from_string("Bad request").with_status_code(400);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    if parsed.secret != my_secret {
+        log_warn!("Sync: rejected a pin push with an invalid secret");
+        let response = Response::from_string("Unauthorized").with_status_code(401);
+        let _ = request.respond(response);
+        return;
+    }
+
+    let _ = conn.execute(
+        "UPDATE clips SET pinned = ?1 WHERE content_hash = ?2",
+        rusqlite::params![parsed.pinned, parsed.content_hash],
+    );
+
+    let response = Response::from_string("{\"status\":\"ok\"}");
     let _ = request.respond(response);
 }
 
@@ -1298,13 +1470,13 @@ fn delete_clip(conn: &Connection, request: tiny_http::Request, url: &str) {
         }
     };
 
-    let row: Result<(String, String), _> = conn.query_row(
-        "SELECT content, content_type FROM clips WHERE id = ?1",
+    let row: Result<(String, String, String), _> = conn.query_row(
+        "SELECT content, content_type, content_hash FROM clips WHERE id = ?1",
         rusqlite::params![id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     );
 
-    let (content, content_type) = match row {
+    let (content, content_type, content_hash) = match row {
         Ok(data) => data,
         Err(_) => {
             let response = Response::from_string("Clip not found").with_status_code(404);
@@ -1323,6 +1495,11 @@ fn delete_clip(conn: &Connection, request: tiny_http::Request, url: &str) {
                 }
             }
             log_info!("Deleted clip {}", id);
+
+            // Live-propagate to every connected peer right now, instead of
+            // waiting for the next pull.
+            propagate_delete_to_peers(content_hash);
+
             let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
             let response = Response::from_string("{\"status\":\"deleted\"}").with_header(header);
             let _ = request.respond(response);
@@ -1346,13 +1523,13 @@ fn toggle_pin(conn: &Connection, request: tiny_http::Request, url: &str) {
         }
     };
 
-    let current: Result<bool, _> = conn.query_row(
-        "SELECT pinned FROM clips WHERE id = ?1",
+    let current: Result<(bool, String), _> = conn.query_row(
+        "SELECT pinned, content_hash FROM clips WHERE id = ?1",
         rusqlite::params![id],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     );
 
-    let current_pinned = match current {
+    let (current_pinned, content_hash) = match current {
         Ok(v) => v,
         Err(_) => {
             let response = Response::from_string("Clip not found").with_status_code(404);
@@ -1369,6 +1546,9 @@ fn toggle_pin(conn: &Connection, request: tiny_http::Request, url: &str) {
 
     match update_result {
         Ok(_) => {
+            // Live-propagate to every connected peer right now.
+            propagate_pin_to_peers(content_hash, new_pinned);
+
             let json = format!("{{\"pinned\":{}}}", new_pinned);
             let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
             let response = Response::from_string(json).with_header(header);
@@ -1568,7 +1748,7 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>, device_id: String) {
                     if save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language, is_sensitive, digest.as_deref(), &device_id) {
                         last_hash = hash;
                         handled_this_tick = true;
-                        notify_peers_of_new_clip();
+                        notify_all_peers_to_pull();
                     }
                 }
             }
@@ -1605,7 +1785,7 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>, device_id: String) {
                                         if let Some(text) = &ocr_text {
                                             log_info!("OCR extracted {} chars", text.len());
                                         }
-                                        notify_peers_of_new_clip();
+                                        notify_all_peers_to_pull();
                                     }
                                 }
                                 Err(e) => {
