@@ -1,3 +1,15 @@
+# Rust build artifacts
 /target
+Cargo.lock
+
+# Local databases and media storage
 clipboard.db
+clipboard.db-shm
+clipboard.db-wal
 clip_images/
+
+# Runtime logs and machine-specific configs
+*.log
+clipboard_daemon.log
+device_config.json
+peers.json

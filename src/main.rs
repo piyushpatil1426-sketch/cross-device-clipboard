@@ -45,6 +45,7 @@ macro_rules! log_warn {
 
 const HTTP_TIMEOUT_SECS: u64 = 5;
 const DISCOVERY_PORT: u16 = 45679;
+const DISCOVERED_DEVICE_TTL_SECS: i64 = 300;
 
 #[derive(Serialize)]
 struct ClipJson {
@@ -59,8 +60,7 @@ struct ClipJson {
     digest: Option<String>,
 }
 
-// --- DEVICE IDENTITY ---
-
+// --- DEVICE IDENTITY 
 #[derive(Serialize, Deserialize, Clone)]
 struct DeviceConfig {
     device_id: String,
@@ -99,8 +99,6 @@ fn generate_secret() -> String {
     let mut rng = rand::thread_rng();
     (0..32).map(|_| format!("{:x}", rng.gen_range(0..16))).collect()
 }
-
-// --- PEER MANAGEMENT ---
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Peer {
@@ -167,8 +165,6 @@ fn list_peers_cli() {
     }
 }
 
-// --- LAN DISCOVERY ---
-
 #[derive(Clone, Serialize)]
 struct DiscoveredDevice {
     device_id: String,
@@ -179,11 +175,6 @@ struct DiscoveredDevice {
 }
 
 type DiscoveryMap = Arc<Mutex<HashMap<String, DiscoveredDevice>>>;
-
-// Sends a short burst of "I'm here" broadcast packets (instead of a
-// continuous loop) so other running instances can discover this device.
-// Triggered on-demand: at startup, when the hotkey opens the UI, or when
-// the user opens the pairing/sync panel — never on a timer.
 fn announce_presence_once(device_id: String, device_name: String) {
     thread::spawn(move || {
         let socket = match UdpSocket::bind("0.0.0.0:0") {
@@ -206,9 +197,6 @@ fn announce_presence_once(device_id: String, device_name: String) {
         }).to_string();
 
         let target = format!("255.255.255.255:{}", DISCOVERY_PORT);
-
-        // A handful of pulses (not an infinite loop) so peers whose UDP
-        // packet gets dropped once still have a couple more chances.
         for _ in 0..3 {
             let _ = socket.send_to(message.as_bytes(), &target);
             thread::sleep(Duration::from_millis(300));
@@ -217,9 +205,6 @@ fn announce_presence_once(device_id: String, device_name: String) {
         log_info!("Discovery: announced presence on the LAN.");
     });
 }
-
-// Listens for other devices' broadcast packets and records them in a shared
-// map the UI can query. Ignores our own broadcasts.
 fn run_discovery_listener(my_device_id: String, discovered: DiscoveryMap) {
     let socket = match UdpSocket::bind(format!("0.0.0.0:{}", DISCOVERY_PORT)) {
         Ok(s) => s,
@@ -251,6 +236,7 @@ fn run_discovery_listener(my_device_id: String, discovered: DiscoveryMap) {
                         map.insert(device_id.clone(), DiscoveredDevice {
                             device_id, device_name, ip, port, last_seen: now,
                         });
+                        map.retain(|_, d| now - d.last_seen <= DISCOVERED_DEVICE_TTL_SECS);
                     }
                 }
             }
@@ -270,6 +256,16 @@ struct PendingRequest {
     ip: String,
     port: u16,
     secret: String,
+    #[serde(skip)]
+    received_at: i64,
+}
+
+// Requests nobody responds to shouldn't sit in memory forever.
+const PENDING_REQUEST_TTL_SECS: i64 = 300;
+
+fn prune_expired_pending(map: &mut HashMap<String, PendingRequest>) {
+    let now = Local::now().timestamp();
+    map.retain(|_, req| now - req.received_at <= PENDING_REQUEST_TTL_SECS);
 }
 
 type PendingRequestsMap = Arc<Mutex<HashMap<String, PendingRequest>>>;
@@ -582,10 +578,6 @@ fn run_combined() {
 
     let discovered: DiscoveryMap = Arc::new(Mutex::new(HashMap::new()));
     let pending: PendingRequestsMap = Arc::new(Mutex::new(HashMap::new()));
-
-    // The discovery listener stays running: it just blocks on a UDP socket
-    // read (no polling, no wakeups, effectively zero CPU/battery cost while
-    // idle) and is what lets this device be found when a peer announces.
     let listener_device_id = device_config.device_id.clone();
     let listener_discovered = Arc::clone(&discovered);
     thread::spawn(move || {
@@ -600,21 +592,12 @@ fn run_combined() {
         let conn = open_db();
         run_watcher(&conn, watcher_paused, watcher_device_id);
     });
-
-    // One-shot presence announce + one-shot sync at startup, replacing the
-    // old 3-second broadcast loop and 2-minute sync interval. After this,
-    // everything is triggered by a real event (see NOTE above run_sync_loop's
-    // old definition).
     let startup_device_id = device_config.device_id.clone();
     let startup_device_name = device_config.device_name.clone();
     announce_presence_once(startup_device_id, startup_device_name);
     thread::spawn(move || {
         sync_all_peers(&sync_device_id, &sync_status_map);
     });
-    // Bidirectional catch-up: also tell every already-authorized peer to
-    // pull from us right now, in case we captured clips while they were
-    // offline. This is what makes "already connected" devices reconcile
-    // immediately instead of waiting for the next event on either side.
     notify_all_peers_to_pull();
 
     let conn = open_db();
@@ -664,9 +647,25 @@ fn open_browser_to_ui(device_id: &str, status_map: &SyncStatusMap) {
         sync_all_peers(&device_id_owned, &status_map_owned);
     });
 
-    let result = process::Command::new("cmd")
-        .args(["/C", "start", "http://127.0.0.1:8080"])
-        .spawn();
+    open_ui_in_browser();
+}
+
+// Opens the default browser to the local dashboard. Uses the right shell
+// command per OS instead of assuming Windows.
+fn open_ui_in_browser() {
+    let result = if cfg!(target_os = "windows") {
+        process::Command::new("cmd")
+            .args(["/C", "start", "http://127.0.0.1:8080"])
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        process::Command::new("open")
+            .arg("http://127.0.0.1:8080")
+            .spawn()
+    } else {
+        process::Command::new("xdg-open")
+            .arg("http://127.0.0.1:8080")
+            .spawn()
+    };
 
     if let Err(e) = result {
         log_warn!("Warning: failed to open browser ({e})");
@@ -810,8 +809,6 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
 }
 
-// --- WEB SERVER ---
-
 fn run_server(
     conn: Connection,
     paused: Arc<AtomicBool>,
@@ -822,7 +819,7 @@ fn run_server(
     discovered: DiscoveryMap,
     pending: PendingRequestsMap,
 ) {
-    let server = match Server::http("127.0.0.1:8080") {
+    let server = match Server::http("0.0.0.0:8080") {
         Ok(s) => s,
         Err(e) => {
             log_warn!("Error: could not start the web server ({e})");
@@ -831,7 +828,7 @@ fn run_server(
         }
     };
 
-    log_info!("Server running at http://127.0.0.1:8080");
+    log_info!("Server running at http://0.0.0.0:8080 (dashboard: http://127.0.0.1:8080)");
 
     for request in server.incoming_requests() {
         let url = request.url().to_string();
@@ -854,8 +851,6 @@ fn run_server(
         } else if url == "/api/discovered" {
             serve_discovered(&discovered, request);
         } else if url == "/api/discover/scan" && method == tiny_http::Method::Post {
-            // On-demand replacement for the old always-on broadcaster: the UI
-            // calls this once when the user opens the pairing/sync panel.
             announce_presence_once(my_device_id.clone(), my_device_name.clone());
             let response = Response::from_string("{\"status\":\"scanning\"}");
             let _ = request.respond(response);
@@ -992,10 +987,6 @@ struct PairingRequestBody {
     port: u16,
     secret: String,
 }
-
-// Someone else's device is asking to pair WITH us. Their real IP comes from
-// the actual TCP connection (remote_addr), never from a claimed field in
-// the body, so this can't be spoofed by lying about an IP in the JSON.
 fn handle_pairing_request(mut request: tiny_http::Request, pending: &PendingRequestsMap) {
     let remote_ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
 
@@ -1009,12 +1000,14 @@ fn handle_pairing_request(mut request: tiny_http::Request, pending: &PendingRequ
     match serde_json::from_str::<PairingRequestBody>(&body) {
         Ok(req) => {
             let mut map = pending.lock().unwrap_or_else(|p| p.into_inner());
+            prune_expired_pending(&mut map);
             map.insert(req.device_id.clone(), PendingRequest {
                 device_id: req.device_id.clone(),
                 device_name: req.device_name.clone(),
                 ip: remote_ip,
                 port: req.port,
                 secret: req.secret,
+                received_at: Local::now().timestamp(),
             });
             log_info!("Pairing: received a connection request from '{}'", req.device_name);
             let response = Response::from_string("{\"status\":\"received\"}");
@@ -1029,7 +1022,8 @@ fn handle_pairing_request(mut request: tiny_http::Request, pending: &PendingRequ
 }
 
 fn serve_pending_requests(pending: &PendingRequestsMap, request: tiny_http::Request) {
-    let map = pending.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = pending.lock().unwrap_or_else(|p| p.into_inner());
+    prune_expired_pending(&mut map);
     let list: Vec<PendingRequest> = map.values().cloned().collect();
     let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
     let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
@@ -1042,10 +1036,6 @@ struct PairingResponseBody {
     accept: bool,
 }
 
-// The user clicked Allow or Deny on a pending request. If allowed: save the
-// requester as a peer, then tell THEM we accepted (including OUR secret),
-// so their device automatically saves us as a peer too — completing both
-// sides without any manual copy/paste.
 fn handle_pairing_respond(mut request: tiny_http::Request, url: &str, pending: &PendingRequestsMap, my_device_id: &str, my_device_name: &str, my_secret: &str, conn: &Connection, status_map: &SyncStatusMap) {
     let device_id = url.trim_start_matches("/api/pairing/respond/").to_string();
 
@@ -1088,14 +1078,9 @@ fn handle_pairing_respond(mut request: tiny_http::Request, url: &str, pending: &
         if let Err(e) = send_result {
             log_warn!("Pairing: failed to notify '{}' of acceptance ({e})", req.device_name);
         }
-
-        // Handshake just completed on our end — sync immediately instead of
-        // waiting for the next hotkey press or a timer.
         let peer_list = load_peers();
         if let Some(peer) = peer_list.peers.iter().find(|p| p.name == req.device_name) {
             sync_with_peer(conn, peer, my_device_id, status_map);
-            // Bidirectional: also tell them to pull from us right now, so
-            // both sides are caught up the moment the connection is live.
             notify_peer_to_pull(peer);
         }
     } else {
@@ -1113,9 +1098,6 @@ struct PairingCompleteBody {
     secret: String,
     accepted: bool,
 }
-
-// The device we originally requested has approved us — auto-save them as
-// a peer using the IP we actually received this from (not a claimed field).
 fn handle_pairing_complete(mut request: tiny_http::Request, my_device_id: &str, conn: &Connection, status_map: &SyncStatusMap) {
     let remote_ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
 
@@ -1166,10 +1148,6 @@ struct SyncDeleteBody {
     content_hash: String,
     secret: String,
 }
-
-// A peer just deleted a clip on their end and is pushing that deletion to us
-// live. We remove it locally by content_hash and deliberately do NOT
-// re-propagate — that would ping-pong the delete back and forth forever.
 fn handle_sync_delete_request(conn: &Connection, my_secret: &str, mut request: tiny_http::Request) {
     let mut body = String::new();
     if request.as_reader().read_to_string(&mut body).is_err() {
@@ -1225,9 +1203,6 @@ struct SyncPinBody {
     pinned: bool,
     secret: String,
 }
-
-// Mirrors handle_sync_delete_request but for pin state. Same rule: apply
-// locally, never re-propagate.
 fn handle_sync_pin_request(conn: &Connection, my_secret: &str, mut request: tiny_http::Request) {
     let mut body = String::new();
     if request.as_reader().read_to_string(&mut body).is_err() {

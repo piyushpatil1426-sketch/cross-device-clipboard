@@ -425,7 +425,10 @@
     <div id="pending-list"></div>
     <div id="no-pending-msg" style="display:none;">No pending requests.</div>
 
-    <div class="section-label">Nearby devices on this network</div>
+    <div class="section-label" style="display:flex; align-items:center; justify-content:space-between;">
+      <span>Nearby devices on this network</span>
+      <button class="copy-btn" id="rescan-btn" style="font-size:11px; padding:3px 8px;">Scan</button>
+    </div>
     <div id="nearby-list"></div>
     <div id="no-nearby-msg" style="display:none;">No devices found nearby yet. Make sure the other device is running and on the same Wi-Fi.</div>
 
@@ -898,6 +901,10 @@ let panelRefreshTimer = null;
 function openSyncPanel() {
   syncModalOverlay.classList.add('open');
   loadDeviceInfo();
+  // On-demand replacement for the old always-on broadcaster: announce our
+  // presence right now so freshly-opened peers show up, then poll the
+  // (passively-collected) list a couple of times to catch replies.
+  fetch('/api/discover/scan', { method: 'POST' }).catch(() => {});
   refreshSyncPanelData();
   // Refresh everything every 3 seconds while the panel is open, so nearby
   // devices, incoming requests, and peer statuses all feel close to live.
@@ -922,6 +929,19 @@ syncPanelBtn.addEventListener('click', openSyncPanel);
 syncModalClose.addEventListener('click', closeSyncPanel);
 syncModalOverlay.addEventListener('click', (e) => {
   if (e.target === syncModalOverlay) closeSyncPanel();
+});
+
+const rescanBtn = document.getElementById('rescan-btn');
+rescanBtn.addEventListener('click', async () => {
+  rescanBtn.disabled = true;
+  rescanBtn.textContent = '...';
+  await fetch('/api/discover/scan', { method: 'POST' }).catch(() => {});
+  // Give peers a moment to reply before refreshing the list.
+  setTimeout(() => {
+    loadNearbyDevices();
+    rescanBtn.disabled = false;
+    rescanBtn.textContent = 'Scan';
+  }, 800);
 });
 
 async function loadDeviceInfo() {
