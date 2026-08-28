@@ -7,28 +7,18 @@ use std::time::Duration;
 use std::fs;
 use std::env;
 use std::process;
-use std::sync::Arc;
+use std::net::UdpSocket;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::collections::{HashMap, HashSet};
 use chrono::Local;
 use image::{RgbaImage, ImageFormat};
 use sha2::{Sha256, Digest};
 use tiny_http::{Server, Response, Header};
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct ClipJson {
-    id: i64,
-    content: String,
-    content_type: String,
-    created_at: String,
-    ocr_text: Option<String>,
-    language: Option<String>,
-    pinned: bool,
-    is_sensitive: bool,
-    digest: Option<String>,
-}
+use serde::{Serialize, Deserialize};
+use rand::Rng;
+use uuid::Uuid;
 
 // --- LOGGING ---
 
@@ -53,6 +43,391 @@ macro_rules! log_warn {
     };
 }
 
+const HTTP_TIMEOUT_SECS: u64 = 5;
+const DISCOVERY_PORT: u16 = 45679;
+
+#[derive(Serialize)]
+struct ClipJson {
+    id: i64,
+    content: String,
+    content_type: String,
+    created_at: String,
+    ocr_text: Option<String>,
+    language: Option<String>,
+    pinned: bool,
+    is_sensitive: bool,
+    digest: Option<String>,
+}
+
+// --- DEVICE IDENTITY ---
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DeviceConfig {
+    device_id: String,
+    device_name: String,
+    secret: String,
+}
+
+fn load_or_create_device_config() -> DeviceConfig {
+    let path = "device_config.json";
+
+    if let Ok(contents) = fs::read_to_string(path) {
+        if let Ok(config) = serde_json::from_str::<DeviceConfig>(&contents) {
+            return config;
+        }
+    }
+
+    let device_id = Uuid::new_v4().to_string();
+    let device_name = whoami_hostname();
+    let secret = generate_secret();
+
+    let config = DeviceConfig { device_id, device_name, secret };
+
+    let json = serde_json::to_string_pretty(&config).expect("Failed to serialize device config");
+    if let Err(e) = fs::write(path, json) {
+        log_warn!("Warning: could not save device_config.json ({e})");
+    }
+
+    config
+}
+
+fn whoami_hostname() -> String {
+    env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown-device".to_string())
+}
+
+fn generate_secret() -> String {
+    let mut rng = rand::thread_rng();
+    (0..32).map(|_| format!("{:x}", rng.gen_range(0..16))).collect()
+}
+
+// --- PEER MANAGEMENT ---
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Peer {
+    name: String,
+    ip: String,
+    port: u16,
+    secret: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PeerList {
+    peers: Vec<Peer>,
+}
+
+fn load_peers() -> PeerList {
+    match fs::read_to_string("peers.json") {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => PeerList::default(),
+    }
+}
+
+fn save_peers(peers: &PeerList) {
+    let json = serde_json::to_string_pretty(peers).expect("Failed to serialize peers");
+    if let Err(e) = fs::write("peers.json", json) {
+        log_warn!("Warning: could not save peers.json ({e})");
+    }
+}
+
+fn add_peer(name: &str, ip: &str, port: u16, secret: &str) {
+    let mut peer_list = load_peers();
+    peer_list.peers.retain(|p| p.name != name);
+
+    peer_list.peers.push(Peer {
+        name: name.to_string(),
+        ip: ip.to_string(),
+        port,
+        secret: secret.to_string(),
+    });
+
+    save_peers(&peer_list);
+    log_info!("Added peer '{}' at {}:{}", name, ip, port);
+}
+
+fn remove_peer(name: &str) {
+    let mut peer_list = load_peers();
+    let before = peer_list.peers.len();
+    peer_list.peers.retain(|p| p.name != name);
+
+    if peer_list.peers.len() < before {
+        save_peers(&peer_list);
+        log_info!("Removed peer '{}'", name);
+    }
+}
+
+fn list_peers_cli() {
+    let peer_list = load_peers();
+    if peer_list.peers.is_empty() {
+        println!("No peers configured yet. Use 'add-peer' to add one.");
+        return;
+    }
+    println!("Configured peers:");
+    for peer in &peer_list.peers {
+        println!("  {} — {}:{}", peer.name, peer.ip, peer.port);
+    }
+}
+
+// --- LAN DISCOVERY ---
+
+#[derive(Clone, Serialize)]
+struct DiscoveredDevice {
+    device_id: String,
+    device_name: String,
+    ip: String,
+    port: u16,
+    last_seen: i64,
+}
+
+type DiscoveryMap = Arc<Mutex<HashMap<String, DiscoveredDevice>>>;
+
+// Sends a short burst of "I'm here" broadcast packets (instead of a
+// continuous loop) so other running instances can discover this device.
+// Triggered on-demand: at startup, when the hotkey opens the UI, or when
+// the user opens the pairing/sync panel — never on a timer.
+fn announce_presence_once(device_id: String, device_name: String) {
+    thread::spawn(move || {
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                log_warn!("Discovery: failed to bind broadcast socket ({e})");
+                return;
+            }
+        };
+
+        if let Err(e) = socket.set_broadcast(true) {
+            log_warn!("Discovery: failed to enable broadcast ({e})");
+            return;
+        }
+
+        let message = serde_json::json!({
+            "device_id": device_id,
+            "device_name": device_name,
+            "port": 8080u16,
+        }).to_string();
+
+        let target = format!("255.255.255.255:{}", DISCOVERY_PORT);
+
+        // A handful of pulses (not an infinite loop) so peers whose UDP
+        // packet gets dropped once still have a couple more chances.
+        for _ in 0..3 {
+            let _ = socket.send_to(message.as_bytes(), &target);
+            thread::sleep(Duration::from_millis(300));
+        }
+
+        log_info!("Discovery: announced presence on the LAN.");
+    });
+}
+
+// Listens for other devices' broadcast packets and records them in a shared
+// map the UI can query. Ignores our own broadcasts.
+fn run_discovery_listener(my_device_id: String, discovered: DiscoveryMap) {
+    let socket = match UdpSocket::bind(format!("0.0.0.0:{}", DISCOVERY_PORT)) {
+        Ok(s) => s,
+        Err(e) => {
+            log_warn!("Discovery: failed to bind listener ({e})");
+            return;
+        }
+    };
+
+    log_info!("Discovery listener started.");
+
+    let mut buf = [0u8; 512];
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((len, src_addr)) => {
+                if let Ok(text) = std::str::from_utf8(&buf[..len]) {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+                        let device_id = parsed.get("device_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if device_id.is_empty() || device_id == my_device_id {
+                            continue;
+                        }
+
+                        let device_name = parsed.get("device_name").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string();
+                        let port = parsed.get("port").and_then(|v| v.as_u64()).unwrap_or(8080) as u16;
+                        let ip = src_addr.ip().to_string();
+                        let now = Local::now().timestamp();
+
+                        let mut map = discovered.lock().unwrap_or_else(|p| p.into_inner());
+                        map.insert(device_id.clone(), DiscoveredDevice {
+                            device_id, device_name, ip, port, last_seen: now,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                log_warn!("Discovery: error receiving broadcast ({e})");
+            }
+        }
+    }
+}
+
+// --- PAIRING (request / approve / auto-complete) ---
+
+#[derive(Clone, Serialize)]
+struct PendingRequest {
+    device_id: String,
+    device_name: String,
+    ip: String,
+    port: u16,
+    secret: String,
+}
+
+type PendingRequestsMap = Arc<Mutex<HashMap<String, PendingRequest>>>;
+
+// --- SYNC ---
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SyncClip {
+    content: String,
+    content_type: String,
+    device_id: String,
+    created_at: String,
+    ocr_text: Option<String>,
+    content_hash: String,
+    language: Option<String>,
+    is_sensitive: bool,
+    digest: Option<String>,
+}
+
+#[derive(Serialize, Clone, Default)]
+struct PeerSyncStatus {
+    last_synced_at: Option<String>,
+    last_imported: usize,
+    last_error: Option<String>,
+}
+
+type SyncStatusMap = Arc<Mutex<HashMap<String, PeerSyncStatus>>>;
+
+fn update_sync_status(status_map: &SyncStatusMap, peer_name: &str, synced_at: Option<String>, imported: usize, error: Option<String>) {
+    let mut map = status_map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.insert(peer_name.to_string(), PeerSyncStatus {
+        last_synced_at: synced_at,
+        last_imported: imported,
+        last_error: error,
+    });
+}
+
+// NOTE: there is intentionally no timer-based fallback loop anymore.
+// Sync now runs strictly on-demand, from one of:
+//   1. The Ctrl+Alt+H hotkey (open_browser_to_ui)
+//   2. The manual POST /api/peers/:name/sync-now endpoint
+//   3. A completed pairing handshake (handle_pairing_respond / handle_pairing_complete)
+//   4. An incoming /api/sync/notify ping from a peer that just synced
+fn sync_all_peers(device_id: &str, status_map: &SyncStatusMap) {
+    let peer_list = load_peers();
+    if peer_list.peers.is_empty() {
+        return;
+    }
+    let conn = open_db();
+    for peer in &peer_list.peers {
+        sync_with_peer(&conn, peer, device_id, status_map);
+    }
+}
+
+fn notify_peers_of_new_clip() {
+    thread::spawn(|| {
+        let peer_list = load_peers();
+        for peer in &peer_list.peers {
+            let url = format!("http://{}:{}/api/sync/notify", peer.ip, peer.port);
+            let _ = ureq::post(&url)
+                .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+                .call();
+        }
+    });
+}
+
+fn sync_with_peer(conn: &Connection, peer: &Peer, device_id: &str, status_map: &SyncStatusMap) {
+    let url = format!("http://{}:{}/api/sync/pull?secret={}", peer.ip, peer.port, peer.secret);
+
+    let response = match ureq::get(&url).timeout(Duration::from_secs(HTTP_TIMEOUT_SECS)).call() {
+        Ok(resp) => resp,
+        Err(e) => {
+            log_warn!("Sync: could not reach peer '{}' ({e})", peer.name);
+            update_sync_status(status_map, &peer.name, None, 0, Some(e.to_string()));
+            return;
+        }
+    };
+
+    let body = match response.into_string() {
+        Ok(b) => b,
+        Err(e) => {
+            log_warn!("Sync: failed to read response from '{}' ({e})", peer.name);
+            update_sync_status(status_map, &peer.name, None, 0, Some(e.to_string()));
+            return;
+        }
+    };
+
+    let remote_clips: Vec<SyncClip> = match serde_json::from_str(&body) {
+        Ok(c) => c,
+        Err(e) => {
+            log_warn!("Sync: failed to parse response from '{}' ({e})", peer.name);
+            update_sync_status(status_map, &peer.name, None, 0, Some(e.to_string()));
+            return;
+        }
+    };
+
+    let mut imported = 0;
+
+    for clip in remote_clips {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM clips WHERE content_hash = ?1)",
+            rusqlite::params![clip.content_hash],
+            |r| r.get(0),
+        ).unwrap_or(false);
+
+        if exists {
+            break;
+        }
+
+        let local_content = if clip.content_type == "image" {
+            match fetch_and_save_remote_image(&peer.ip, peer.port, &clip.content, &peer.name) {
+                Some(path) => path,
+                None => {
+                    log_warn!("Sync: failed to fetch image {} from '{}'", clip.content, peer.name);
+                    continue;
+                }
+            }
+        } else {
+            clip.content.clone()
+        };
+
+        let insert_result = conn.execute(
+            "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash, language, is_sensitive, digest, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+            rusqlite::params![local_content, clip.content_type, clip.device_id, clip.created_at, clip.ocr_text, clip.content_hash, clip.language, clip.is_sensitive, clip.digest],
+        );
+
+        if insert_result.is_ok() {
+            imported += 1;
+        }
+    }
+
+    if imported > 0 {
+        log_info!("Sync: imported {} new clip(s) from '{}'", imported, peer.name);
+    }
+
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    update_sync_status(status_map, &peer.name, Some(now), imported, None);
+    let _ = device_id;
+}
+
+fn fetch_and_save_remote_image(ip: &str, port: u16, remote_path: &str, peer_name: &str) -> Option<String> {
+    let url = format!("http://{}:{}/{}", ip, port, remote_path);
+    let response = ureq::get(&url).timeout(Duration::from_secs(HTTP_TIMEOUT_SECS)).call().ok()?;
+
+    let mut bytes: Vec<u8> = Vec::new();
+    response.into_reader().read_to_end(&mut bytes).ok()?;
+
+    let filename_only = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    let safe_peer_name: String = peer_name.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+    let local_path = format!("clip_images/sync_{}_{}", safe_peer_name, filename_only);
+
+    fs::create_dir_all("clip_images").ok()?;
+    fs::write(&local_path, bytes).ok()?;
+
+    Some(local_path)
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -62,11 +437,34 @@ fn main() {
     } else if args.len() >= 2 && args[1] == "watch" {
         let conn = open_db();
         let paused = Arc::new(AtomicBool::new(false));
-        run_watcher(&conn, paused);
+        let device_config = load_or_create_device_config();
+        run_watcher(&conn, paused, device_config.device_id);
     } else if args.len() >= 2 && args[1] == "serve" {
         let conn = open_db();
         let paused = Arc::new(AtomicBool::new(false));
-        run_server(conn, paused);
+        let device_config = load_or_create_device_config();
+        let status_map: SyncStatusMap = Arc::new(Mutex::new(HashMap::new()));
+        let discovered: DiscoveryMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingRequestsMap = Arc::new(Mutex::new(HashMap::new()));
+        run_server(conn, paused, device_config.secret, device_config.device_id, device_config.device_name, status_map, discovered, pending);
+    } else if args.len() >= 2 && args[1] == "whoami" {
+        let config = load_or_create_device_config();
+        println!("Device name: {}", config.device_name);
+        println!("Device ID:   {}", config.device_id);
+        println!("Secret:      {}", config.secret);
+        println!();
+        println!("Share your device name, your LAN IP, port 8080, and this secret");
+        println!("with any device you want to authorize to sync with you.");
+    } else if args.len() >= 6 && args[1] == "add-peer" {
+        let name = &args[2];
+        let ip = &args[3];
+        let port: u16 = args[4].parse().unwrap_or(8080);
+        let secret = &args[5];
+        add_peer(name, ip, port, secret);
+    } else if args.len() >= 3 && args[1] == "remove-peer" {
+        remove_peer(&args[2]);
+    } else if args.len() >= 2 && args[1] == "list-peers" {
+        list_peers_cli();
     } else {
         run_combined();
     }
@@ -110,25 +508,59 @@ fn open_db() -> Connection {
 fn run_combined() {
     log_info!("Starting clipboard capture + web UI together...");
 
+    let device_config = load_or_create_device_config();
+    log_info!("Device identity: {} ({})", device_config.device_name, device_config.device_id);
+
     let paused = Arc::new(AtomicBool::new(false));
     let watcher_paused = Arc::clone(&paused);
+    let watcher_device_id = device_config.device_id.clone();
 
-    thread::spawn(|| {
-        run_hotkey_listener();
+    let status_map: SyncStatusMap = Arc::new(Mutex::new(HashMap::new()));
+    let sync_status_map = Arc::clone(&status_map);
+    let sync_device_id = device_config.device_id.clone();
+
+    let hotkey_device_id = device_config.device_id.clone();
+    let hotkey_status_map = Arc::clone(&status_map);
+
+    let discovered: DiscoveryMap = Arc::new(Mutex::new(HashMap::new()));
+    let pending: PendingRequestsMap = Arc::new(Mutex::new(HashMap::new()));
+
+    // The discovery listener stays running: it just blocks on a UDP socket
+    // read (no polling, no wakeups, effectively zero CPU/battery cost while
+    // idle) and is what lets this device be found when a peer announces.
+    let listener_device_id = device_config.device_id.clone();
+    let listener_discovered = Arc::clone(&discovered);
+    thread::spawn(move || {
+        run_discovery_listener(listener_device_id, listener_discovered);
+    });
+
+    thread::spawn(move || {
+        run_hotkey_listener(hotkey_device_id, hotkey_status_map);
     });
 
     thread::spawn(move || {
         let conn = open_db();
-        run_watcher(&conn, watcher_paused);
+        run_watcher(&conn, watcher_paused, watcher_device_id);
+    });
+
+    // One-shot presence announce + one-shot sync at startup, replacing the
+    // old 3-second broadcast loop and 2-minute sync interval. After this,
+    // everything is triggered by a real event (see NOTE above run_sync_loop's
+    // old definition).
+    let startup_device_id = device_config.device_id.clone();
+    let startup_device_name = device_config.device_name.clone();
+    announce_presence_once(startup_device_id, startup_device_name);
+    thread::spawn(move || {
+        sync_all_peers(&sync_device_id, &sync_status_map);
     });
 
     let conn = open_db();
-    run_server(conn, paused);
+    run_server(conn, paused, device_config.secret, device_config.device_id, device_config.device_name, status_map, discovered, pending);
 }
 
 // --- GLOBAL HOTKEY ---
 
-fn run_hotkey_listener() {
+fn run_hotkey_listener(device_id: String, status_map: SyncStatusMap) {
     use device_query::{DeviceQuery, DeviceState, Keycode};
 
     let device_state = DeviceState::new();
@@ -145,7 +577,7 @@ fn run_hotkey_listener() {
         let combo_pressed = ctrl && alt && h_pressed;
 
         if combo_pressed && !was_pressed {
-            open_browser_to_ui();
+            open_browser_to_ui(&device_id, &status_map);
         }
 
         was_pressed = combo_pressed;
@@ -154,8 +586,21 @@ fn run_hotkey_listener() {
     }
 }
 
-fn open_browser_to_ui() {
+fn open_browser_to_ui(device_id: &str, status_map: &SyncStatusMap) {
     log_info!("Hotkey pressed — opening clipboard UI...");
+
+    // Opening the UI is a real user action, so it's a legitimate moment to
+    // both re-announce our presence (in case a peer restarted recently) and
+    // sync with everyone we already know about.
+    let device_name = load_or_create_device_config().device_name;
+    announce_presence_once(device_id.to_string(), device_name);
+
+    let device_id_owned = device_id.to_string();
+    let status_map_owned = Arc::clone(status_map);
+    thread::spawn(move || {
+        sync_all_peers(&device_id_owned, &status_map_owned);
+    });
+
     let result = process::Command::new("cmd")
         .args(["/C", "start", "http://127.0.0.1:8080"])
         .spawn();
@@ -219,23 +664,14 @@ fn detect_sensitive(content: &str) -> bool {
     keywords.iter().any(|k| lower.contains(k))
 }
 
-// --- DIGEST GENERATION (extractive summarization) ---
-//
-// Uses word-frequency scoring (a simplified version of Luhn's classic 1958
-// extractive summarization algorithm): split into sentences, count how often
-// each meaningful word appears across the whole text, then pick the sentence
-// whose words are, on average, the most frequent/important. This is a real,
-// well-established technique — not an LLM, but a principled local heuristic
-// requiring no external model.
+// --- DIGEST GENERATION ---
+
 fn generate_digest(content: &str, language: &str) -> Option<String> {
     let char_count = content.chars().count();
     if char_count < 200 {
-        // Short enough to just read directly — a digest wouldn't add value.
         return None;
     }
 
-    // Code doesn't decompose into "sentences" meaningfully — give a
-    // structural summary instead.
     if language != "text" && language != "n/a" {
         let line_count = content.lines().count();
         return Some(format!("{} lines of {} code", line_count, language));
@@ -264,7 +700,6 @@ fn generate_digest(content: &str, language: &str) -> Option<String> {
         return Some(truncate_str(sentences[0], 140));
     }
 
-    // Count how often each meaningful word appears across all sentences.
     let mut word_freq: HashMap<String, u32> = HashMap::new();
     for sentence in &sentences {
         for word in sentence.split_whitespace() {
@@ -278,8 +713,6 @@ fn generate_digest(content: &str, language: &str) -> Option<String> {
         }
     }
 
-    // Score each sentence by its words' combined frequency, normalized by
-    // sentence length so long sentences don't win purely by having more words.
     let mut best_sentence = sentences[0];
     let mut best_score = -1.0_f64;
 
@@ -316,7 +749,16 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 
 // --- WEB SERVER ---
 
-fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
+fn run_server(
+    conn: Connection,
+    paused: Arc<AtomicBool>,
+    my_secret: String,
+    my_device_id: String,
+    my_device_name: String,
+    status_map: SyncStatusMap,
+    discovered: DiscoveryMap,
+    pending: PendingRequestsMap,
+) {
     let server = match Server::http("127.0.0.1:8080") {
         Ok(s) => s,
         Err(e) => {
@@ -344,6 +786,38 @@ fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
             paused.store(false, Ordering::Relaxed);
             log_info!("Capture resumed.");
             serve_status(&paused, request);
+        } else if url == "/api/device" {
+            serve_device_info(request);
+        } else if url == "/api/discovered" {
+            serve_discovered(&discovered, request);
+        } else if url == "/api/discover/scan" && method == tiny_http::Method::Post {
+            // On-demand replacement for the old always-on broadcaster: the UI
+            // calls this once when the user opens the pairing/sync panel.
+            announce_presence_once(my_device_id.clone(), my_device_name.clone());
+            let response = Response::from_string("{\"status\":\"scanning\"}");
+            let _ = request.respond(response);
+        } else if url == "/api/pairing/send-request" && method == tiny_http::Method::Post {
+            handle_send_pairing_request(request, &discovered, &my_device_id, &my_device_name, &my_secret);
+        } else if url == "/api/pairing/request" && method == tiny_http::Method::Post {
+            handle_pairing_request(request, &pending);
+        } else if url == "/api/pairing/pending" {
+            serve_pending_requests(&pending, request);
+        } else if url.starts_with("/api/pairing/respond/") && method == tiny_http::Method::Post {
+            handle_pairing_respond(request, &url, &pending, &my_device_id, &my_device_name, &my_secret, &conn, &status_map);
+        } else if url == "/api/pairing/complete" && method == tiny_http::Method::Post {
+            handle_pairing_complete(request, &my_device_id, &conn, &status_map);
+        } else if url == "/api/peers" && method == tiny_http::Method::Get {
+            serve_list_peers(&status_map, request);
+        } else if url == "/api/peers" && method == tiny_http::Method::Post {
+            handle_add_peer_request(request);
+        } else if url.starts_with("/api/peers/") && url.ends_with("/sync-now") && method == tiny_http::Method::Post {
+            handle_sync_now_request(&conn, &my_device_id, &status_map, request, &url);
+        } else if url.starts_with("/api/peers/") && method == tiny_http::Method::Delete {
+            handle_remove_peer_request(request, &url);
+        } else if url == "/api/sync/notify" && method == tiny_http::Method::Post {
+            handle_sync_notify(request, my_device_id.clone(), Arc::clone(&status_map));
+        } else if url.starts_with("/api/sync/pull") {
+            serve_sync_pull(&conn, &my_secret, request, &url);
         } else if url.starts_with("/api/clips/") && url.ends_with("/toggle-pin") && method == tiny_http::Method::Post {
             toggle_pin(&conn, request, &url);
         } else if url.starts_with("/api/clips/") && method == tiny_http::Method::Delete {
@@ -366,6 +840,395 @@ fn run_server(conn: Connection, paused: Arc<AtomicBool>) {
             let _ = request.respond(response);
         }
     }
+}
+
+fn serve_discovered(discovered: &DiscoveryMap, request: tiny_http::Request) {
+    let now = Local::now().timestamp();
+    let map = discovered.lock().unwrap_or_else(|p| p.into_inner());
+    let list: Vec<DiscoveredDevice> = map.values()
+        .filter(|d| now - d.last_seen <= 15)
+        .cloned()
+        .collect();
+    let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = Response::from_string(json).with_header(header);
+    let _ = request.respond(response);
+}
+
+#[derive(Deserialize)]
+struct SendRequestBody {
+    device_id: String,
+}
+
+fn handle_send_pairing_request(mut request: tiny_http::Request, discovered: &DiscoveryMap, my_device_id: &str, my_device_name: &str, my_secret: &str) {
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        let response = Response::from_string("Bad request").with_status_code(400);
+        let _ = request.respond(response);
+        return;
+    }
+
+    let target_id = match serde_json::from_str::<SendRequestBody>(&body) {
+        Ok(b) => b.device_id,
+        Err(_) => {
+            let response = Response::from_string("Bad request").with_status_code(400);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    let target = {
+        let map = discovered.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&target_id).cloned()
+    };
+
+    let target = match target {
+        Some(t) => t,
+        None => {
+            let response = Response::from_string("Device not found").with_status_code(404);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    let request_url = format!("http://{}:{}/api/pairing/request", target.ip, target.port);
+    let request_body = serde_json::json!({
+        "device_id": my_device_id,
+        "device_name": my_device_name,
+        "port": 8080,
+        "secret": my_secret
+    }).to_string();
+
+    let send_result = ureq::post(&request_url)
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .send_string(&request_body);
+
+    match send_result {
+        Ok(_) => {
+            log_info!("Pairing: sent a connection request to '{}'", target.device_name);
+            let response = Response::from_string("{\"status\":\"sent\"}");
+            let _ = request.respond(response);
+        }
+        Err(e) => {
+            log_warn!("Pairing: failed to send request to '{}' ({e})", target.device_name);
+            let response = Response::from_string("Failed to send request").with_status_code(500);
+            let _ = request.respond(response);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PairingRequestBody {
+    device_id: String,
+    device_name: String,
+    port: u16,
+    secret: String,
+}
+
+// Someone else's device is asking to pair WITH us. Their real IP comes from
+// the actual TCP connection (remote_addr), never from a claimed field in
+// the body, so this can't be spoofed by lying about an IP in the JSON.
+fn handle_pairing_request(mut request: tiny_http::Request, pending: &PendingRequestsMap) {
+    let remote_ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        let response = Response::from_string("Bad request").with_status_code(400);
+        let _ = request.respond(response);
+        return;
+    }
+
+    match serde_json::from_str::<PairingRequestBody>(&body) {
+        Ok(req) => {
+            let mut map = pending.lock().unwrap_or_else(|p| p.into_inner());
+            map.insert(req.device_id.clone(), PendingRequest {
+                device_id: req.device_id.clone(),
+                device_name: req.device_name.clone(),
+                ip: remote_ip,
+                port: req.port,
+                secret: req.secret,
+            });
+            log_info!("Pairing: received a connection request from '{}'", req.device_name);
+            let response = Response::from_string("{\"status\":\"received\"}");
+            let _ = request.respond(response);
+        }
+        Err(e) => {
+            log_warn!("Pairing: bad request body ({e})");
+            let response = Response::from_string("Bad request").with_status_code(400);
+            let _ = request.respond(response);
+        }
+    }
+}
+
+fn serve_pending_requests(pending: &PendingRequestsMap, request: tiny_http::Request) {
+    let map = pending.lock().unwrap_or_else(|p| p.into_inner());
+    let list: Vec<PendingRequest> = map.values().cloned().collect();
+    let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = Response::from_string(json).with_header(header);
+    let _ = request.respond(response);
+}
+
+#[derive(Deserialize)]
+struct PairingResponseBody {
+    accept: bool,
+}
+
+// The user clicked Allow or Deny on a pending request. If allowed: save the
+// requester as a peer, then tell THEM we accepted (including OUR secret),
+// so their device automatically saves us as a peer too — completing both
+// sides without any manual copy/paste.
+fn handle_pairing_respond(mut request: tiny_http::Request, url: &str, pending: &PendingRequestsMap, my_device_id: &str, my_device_name: &str, my_secret: &str, conn: &Connection, status_map: &SyncStatusMap) {
+    let device_id = url.trim_start_matches("/api/pairing/respond/").to_string();
+
+    let mut body = String::new();
+    let _ = request.as_reader().read_to_string(&mut body);
+    let accept = serde_json::from_str::<PairingResponseBody>(&body).map(|b| b.accept).unwrap_or(false);
+
+    let maybe_req = {
+        let mut map = pending.lock().unwrap_or_else(|p| p.into_inner());
+        map.remove(&device_id)
+    };
+
+    let req = match maybe_req {
+        Some(r) => r,
+        None => {
+            let response = Response::from_string("Request not found").with_status_code(404);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    if accept {
+        add_peer(&req.device_name, &req.ip, req.port, &req.secret);
+        log_info!("Pairing: accepted connection with '{}'", req.device_name);
+
+        let complete_url = format!("http://{}:{}/api/pairing/complete", req.ip, req.port);
+        let complete_body = serde_json::json!({
+            "device_id": my_device_id,
+            "device_name": my_device_name,
+            "port": 8080,
+            "secret": my_secret,
+            "accepted": true
+        }).to_string();
+
+        let send_result = ureq::post(&complete_url)
+            .set("Content-Type", "application/json")
+            .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+            .send_string(&complete_body);
+
+        if let Err(e) = send_result {
+            log_warn!("Pairing: failed to notify '{}' of acceptance ({e})", req.device_name);
+        }
+
+        // Handshake just completed on our end — sync immediately instead of
+        // waiting for the next hotkey press or a timer.
+        let peer_list = load_peers();
+        if let Some(peer) = peer_list.peers.iter().find(|p| p.name == req.device_name) {
+            sync_with_peer(conn, peer, my_device_id, status_map);
+        }
+    } else {
+        log_info!("Pairing: declined connection request from '{}'", req.device_name);
+    }
+
+    let response = Response::from_string("{\"status\":\"ok\"}");
+    let _ = request.respond(response);
+}
+
+#[derive(Deserialize)]
+struct PairingCompleteBody {
+    device_name: String,
+    port: u16,
+    secret: String,
+    accepted: bool,
+}
+
+// The device we originally requested has approved us — auto-save them as
+// a peer using the IP we actually received this from (not a claimed field).
+fn handle_pairing_complete(mut request: tiny_http::Request, my_device_id: &str, conn: &Connection, status_map: &SyncStatusMap) {
+    let remote_ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        let response = Response::from_string("Bad request").with_status_code(400);
+        let _ = request.respond(response);
+        return;
+    }
+
+    match serde_json::from_str::<PairingCompleteBody>(&body) {
+        Ok(resp) => {
+            if resp.accepted {
+                add_peer(&resp.device_name, &remote_ip, resp.port, &resp.secret);
+                log_info!("Pairing: '{}' accepted our request — now connected", resp.device_name);
+
+                // Handshake just completed on the requester's end too — sync
+                // right away rather than waiting on a timer.
+                let peer_list = load_peers();
+                if let Some(peer) = peer_list.peers.iter().find(|p| p.name == resp.device_name) {
+                    sync_with_peer(conn, peer, my_device_id, status_map);
+                }
+            }
+            let response = Response::from_string("{\"status\":\"ok\"}");
+            let _ = request.respond(response);
+        }
+        Err(e) => {
+            log_warn!("Pairing: bad completion body ({e})");
+            let response = Response::from_string("Bad request").with_status_code(400);
+            let _ = request.respond(response);
+        }
+    }
+}
+
+fn handle_sync_notify(request: tiny_http::Request, device_id: String, status_map: SyncStatusMap) {
+    thread::spawn(move || {
+        sync_all_peers(&device_id, &status_map);
+    });
+
+    let response = Response::from_string("{\"status\":\"triggered\"}");
+    let _ = request.respond(response);
+}
+
+fn serve_device_info(request: tiny_http::Request) {
+    let config = load_or_create_device_config();
+    let json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = Response::from_string(json).with_header(header);
+    let _ = request.respond(response);
+}
+
+#[derive(Serialize)]
+struct PeerWithStatus {
+    name: String,
+    ip: String,
+    port: u16,
+    last_synced_at: Option<String>,
+    last_imported: usize,
+    last_error: Option<String>,
+}
+
+fn serve_list_peers(status_map: &SyncStatusMap, request: tiny_http::Request) {
+    let peer_list = load_peers();
+    let status = status_map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let result: Vec<PeerWithStatus> = peer_list.peers.iter().map(|p| {
+        let s = status.get(&p.name);
+        PeerWithStatus {
+            name: p.name.clone(),
+            ip: p.ip.clone(),
+            port: p.port,
+            last_synced_at: s.and_then(|s| s.last_synced_at.clone()),
+            last_imported: s.map(|s| s.last_imported).unwrap_or(0),
+            last_error: s.and_then(|s| s.last_error.clone()),
+        }
+    }).collect();
+
+    let json = serde_json::to_string(&result).unwrap_or_else(|_| "[]".to_string());
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = Response::from_string(json).with_header(header);
+    let _ = request.respond(response);
+}
+
+#[derive(Deserialize)]
+struct AddPeerRequest {
+    name: String,
+    ip: String,
+    port: u16,
+    secret: String,
+}
+
+fn handle_add_peer_request(mut request: tiny_http::Request) {
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        let response = Response::from_string("Failed to read request body").with_status_code(400);
+        let _ = request.respond(response);
+        return;
+    }
+
+    match serde_json::from_str::<AddPeerRequest>(&body) {
+        Ok(req) => {
+            add_peer(&req.name, &req.ip, req.port, &req.secret);
+            let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+            let response = Response::from_string("{\"status\":\"added\"}").with_header(header);
+            let _ = request.respond(response);
+        }
+        Err(e) => {
+            log_warn!("Warning: failed to parse add-peer request ({e})");
+            let response = Response::from_string("Invalid request body").with_status_code(400);
+            let _ = request.respond(response);
+        }
+    }
+}
+
+fn handle_remove_peer_request(request: tiny_http::Request, url: &str) {
+    let name_encoded = url.trim_start_matches("/api/peers/");
+    let name = urlencoding_decode(name_encoded);
+    remove_peer(&name);
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = Response::from_string("{\"status\":\"removed\"}").with_header(header);
+    let _ = request.respond(response);
+}
+
+fn handle_sync_now_request(conn: &Connection, device_id: &str, status_map: &SyncStatusMap, request: tiny_http::Request, url: &str) {
+    let trimmed = url.trim_start_matches("/api/peers/").trim_end_matches("/sync-now");
+    let name = urlencoding_decode(trimmed);
+
+    let peer_list = load_peers();
+    if let Some(peer) = peer_list.peers.iter().find(|p| p.name == name) {
+        sync_with_peer(conn, peer, device_id, status_map);
+        let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+        let response = Response::from_string("{\"status\":\"synced\"}").with_header(header);
+        let _ = request.respond(response);
+    } else {
+        let response = Response::from_string("Peer not found").with_status_code(404);
+        let _ = request.respond(response);
+    }
+}
+
+fn serve_sync_pull(conn: &Connection, my_secret: &str, request: tiny_http::Request, url: &str) {
+    let provided_secret = url.split('?').nth(1)
+        .and_then(|qs| qs.split('&').find(|p| p.starts_with("secret=")))
+        .map(|p| p.trim_start_matches("secret="))
+        .unwrap_or("");
+
+    if provided_secret != my_secret {
+        log_warn!("Sync: rejected pull request with an invalid secret");
+        let response = Response::from_string("Unauthorized").with_status_code(401);
+        let _ = request.respond(response);
+        return;
+    }
+
+    let mut stmt = match conn.prepare(
+        "SELECT content, content_type, device_id, created_at, ocr_text, content_hash, language, is_sensitive, digest
+         FROM clips ORDER BY created_at DESC LIMIT 500"
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log_warn!("Sync: failed to prepare pull query ({e})");
+            let response = Response::from_string("[]").with_status_code(500);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    let rows: Vec<SyncClip> = stmt.query_map([], |row| {
+        Ok(SyncClip {
+            content: row.get(0)?,
+            content_type: row.get(1)?,
+            device_id: row.get(2)?,
+            created_at: row.get(3)?,
+            ocr_text: row.get(4)?,
+            content_hash: row.get(5)?,
+            language: row.get(6)?,
+            is_sensitive: row.get(7)?,
+            digest: row.get(8)?,
+        })
+    }).map(|iter| iter.filter_map(|r| r.ok()).collect()).unwrap_or_default();
+
+    let json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = Response::from_string(json).with_header(header);
+    let _ = request.respond(response);
 }
 
 fn serve_status(paused: &Arc<AtomicBool>, request: tiny_http::Request) {
@@ -654,7 +1517,7 @@ fn run_search(conn: &Connection, query: &str) {
 
 // --- WATCHER ---
 
-fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
+fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>, device_id: String) {
     if let Err(e) = fs::create_dir_all("clip_images") {
         log_warn!("Error: could not create clip_images folder ({e})");
         return;
@@ -702,9 +1565,10 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
                     let language = detect_language(&current_text);
                     let is_sensitive = detect_sensitive(&current_text);
                     let digest = generate_digest(&current_text, &language);
-                    if save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language, is_sensitive, digest.as_deref()) {
+                    if save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language, is_sensitive, digest.as_deref(), &device_id) {
                         last_hash = hash;
                         handled_this_tick = true;
+                        notify_peers_of_new_clip();
                     }
                 }
             }
@@ -735,12 +1599,13 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>) {
                                         .as_deref()
                                         .and_then(|t| generate_digest(t, "text"));
 
-                                    if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a", is_sensitive, digest.as_deref()) {
+                                    if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a", is_sensitive, digest.as_deref(), &device_id) {
                                         last_hash = hash;
                                         log_info!("Saved screenshot: {}", filename);
                                         if let Some(text) = &ocr_text {
                                             log_info!("OCR extracted {} chars", text.len());
                                         }
+                                        notify_peers_of_new_clip();
                                     }
                                 }
                                 Err(e) => {
@@ -800,13 +1665,14 @@ fn save_clip_with_ocr(
     language: &str,
     is_sensitive: bool,
     digest: Option<&str>,
+    device_id: &str,
 ) -> bool {
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let result = conn.execute(
         "INSERT INTO clips (content, content_type, device_id, created_at, ocr_text, content_hash, language, is_sensitive, digest)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        rusqlite::params![content, content_type, "windows-pc", timestamp, ocr_text, content_hash, language, is_sensitive, digest],
+        rusqlite::params![content, content_type, device_id, timestamp, ocr_text, content_hash, language, is_sensitive, digest],
     );
 
     match result {
