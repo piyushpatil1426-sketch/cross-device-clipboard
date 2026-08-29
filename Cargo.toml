@@ -17,3 +17,4 @@ device_query = "4.0.1"
 uuid = { version = "1.25.0", features = ["v4"] }
 rand = "0.8"
 ureq = "2"
+llama-cpp-2 = "0.1.154"

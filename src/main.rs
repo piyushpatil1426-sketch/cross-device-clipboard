@@ -46,6 +46,9 @@ macro_rules! log_warn {
 const HTTP_TIMEOUT_SECS: u64 = 5;
 const DISCOVERY_PORT: u16 = 45679;
 const DISCOVERED_DEVICE_TTL_SECS: i64 = 300;
+const EMBEDDING_MODEL_PATH: &str = "models/nomic-embed-text-v1.5.Q4_K_M.gguf";
+const EMBEDDING_MODEL_NAME: &str = "nomic-embed-text-v1.5";
+const MAX_EMBED_INPUT_CHARS: usize = 1500;
 
 #[derive(Serialize)]
 struct ClipJson {
@@ -60,7 +63,8 @@ struct ClipJson {
     digest: Option<String>,
 }
 
-// --- DEVICE IDENTITY 
+// --- DEVICE IDENTITY ---
+
 #[derive(Serialize, Deserialize, Clone)]
 struct DeviceConfig {
     device_id: String,
@@ -99,6 +103,8 @@ fn generate_secret() -> String {
     let mut rng = rand::thread_rng();
     (0..32).map(|_| format!("{:x}", rng.gen_range(0..16))).collect()
 }
+
+// --- PEER MANAGEMENT ---
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Peer {
@@ -165,6 +171,8 @@ fn list_peers_cli() {
     }
 }
 
+// --- LAN DISCOVERY ---
+
 #[derive(Clone, Serialize)]
 struct DiscoveredDevice {
     device_id: String,
@@ -197,6 +205,9 @@ fn announce_presence_once(device_id: String, device_name: String) {
         }).to_string();
 
         let target = format!("255.255.255.255:{}", DISCOVERY_PORT);
+
+        // A handful of pulses (not an infinite loop) so peers whose UDP
+        // packet gets dropped once still have a couple more chances.
         for _ in 0..3 {
             let _ = socket.send_to(message.as_bytes(), &target);
             thread::sleep(Duration::from_millis(300));
@@ -236,6 +247,8 @@ fn run_discovery_listener(my_device_id: String, discovered: DiscoveryMap) {
                         map.insert(device_id.clone(), DiscoveredDevice {
                             device_id, device_name, ip, port, last_seen: now,
                         });
+                        // Garbage-collect anything not seen in a while so
+                        // this map doesn't grow forever over a long uptime.
                         map.retain(|_, d| now - d.last_seen <= DISCOVERED_DEVICE_TTL_SECS);
                     }
                 }
@@ -260,7 +273,6 @@ struct PendingRequest {
     received_at: i64,
 }
 
-// Requests nobody responds to shouldn't sit in memory forever.
 const PENDING_REQUEST_TTL_SECS: i64 = 300;
 
 fn prune_expired_pending(map: &mut HashMap<String, PendingRequest>) {
@@ -302,13 +314,6 @@ fn update_sync_status(status_map: &SyncStatusMap, peer_name: &str, synced_at: Op
         last_error: error,
     });
 }
-
-// NOTE: there is intentionally no timer-based fallback loop anymore.
-// Sync now runs strictly on-demand, from one of:
-//   1. The Ctrl+Alt+H hotkey (open_browser_to_ui)
-//   2. The manual POST /api/peers/:name/sync-now endpoint
-//   3. A completed pairing handshake (handle_pairing_respond / handle_pairing_complete)
-//   4. An incoming /api/sync/notify ping from a peer that just synced
 fn sync_all_peers(device_id: &str, status_map: &SyncStatusMap) {
     let peer_list = load_peers();
     if peer_list.peers.is_empty() {
@@ -319,10 +324,6 @@ fn sync_all_peers(device_id: &str, status_map: &SyncStatusMap) {
         sync_with_peer(&conn, peer, device_id, status_map);
     }
 }
-
-// Tells every known peer "something changed on my end, pull it now" — used
-// after a new clip is captured, and (via notify_peer_to_pull) for the
-// bidirectional catch-up that runs at startup and right after pairing.
 fn notify_all_peers_to_pull() {
     thread::spawn(|| {
         let peer_list = load_peers();
@@ -338,11 +339,6 @@ fn notify_peer_to_pull(peer: &Peer) {
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .call();
 }
-
-// Pushes a deletion to every connected peer the instant it happens locally
-// (not on a timer, not on the next pull) so both devices stay identical
-// while the connection is active. Peers apply this by content_hash and do
-// NOT re-propagate it, so this never loops back and forth.
 fn propagate_delete_to_peers(content_hash: String) {
     thread::spawn(move || {
         let peer_list = load_peers();
@@ -365,8 +361,6 @@ fn propagate_delete_to_peers(content_hash: String) {
     });
 }
 
-// Pushes a pin/unpin the instant it happens locally, same reasoning as
-// propagate_delete_to_peers above.
 fn propagate_pin_to_peers(content_hash: String, pinned: bool) {
     thread::spawn(move || {
         let peer_list = load_peers();
@@ -453,6 +447,15 @@ fn sync_with_peer(conn: &Connection, peer: &Peer, device_id: &str, status_map: &
 
         if insert_result.is_ok() {
             imported += 1;
+            let new_clip_id = conn.last_insert_rowid();
+            let text_to_embed = if clip.content_type == "image" {
+                clip.ocr_text.clone()
+            } else {
+                Some(local_content.clone())
+            };
+            if let Some(text) = text_to_embed {
+                compute_and_store_embedding_async(new_clip_id, text);
+            }
         }
     }
 
@@ -534,6 +537,8 @@ fn open_db() -> Connection {
         }
     };
 
+    let _ = conn.execute("PRAGMA foreign_keys = ON", []);
+
     let create_result = conn.execute(
         "CREATE TABLE IF NOT EXISTS clips (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -556,7 +561,115 @@ fn open_db() -> Connection {
         process::exit(1);
     }
 
+    let embeddings_result = conn.execute(
+        "CREATE TABLE IF NOT EXISTS embeddings (
+            clip_id    INTEGER PRIMARY KEY,
+            embedding  BLOB NOT NULL,
+            model      TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (clip_id) REFERENCES clips(id) ON DELETE CASCADE
+        )",
+        [],
+    );
+
+    if let Err(e) = embeddings_result {
+        log_warn!("Error: could not set up the embeddings table ({e})");
+        process::exit(1);
+    }
+
     conn
+}
+
+// --- SEMANTIC EMBEDDINGS ---
+fn embed_text(text: &str) -> Option<Vec<f32>> {
+    use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use llama_cpp_2::llama_batch::LlamaBatch;
+    use llama_cpp_2::model::params::LlamaModelParams;
+    use llama_cpp_2::model::{AddBos, LlamaModel};
+
+    let model_path = std::path::Path::new(EMBEDDING_MODEL_PATH);
+    if !model_path.exists() {
+        return None;
+    }
+
+    let truncated: String = text.chars().take(MAX_EMBED_INPUT_CHARS).collect();
+
+    let backend = LlamaBackend::init().ok()?;
+    let model_params = LlamaModelParams::default();
+    let model = LlamaModel::load_from_file(&backend, model_path, &model_params).ok()?;
+
+    let ctx_params = LlamaContextParams::default()
+        .with_embeddings(true)
+        .with_pooling_type(LlamaPoolingType::Mean);
+    let mut ctx = model.new_context(&backend, ctx_params).ok()?;
+
+    let tokens = model.str_to_token(&truncated, AddBos::Always).ok()?;
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut batch = LlamaBatch::new(tokens.len(), 1);
+    for (i, token) in tokens.iter().enumerate() {
+        if batch.add(*token, i as i32, &[0], true).is_err() {
+            return None;
+        }
+    }
+
+    if ctx.decode(&mut batch).is_err() {
+        return None;
+    }
+
+    let embedding = ctx.embeddings_seq_ith(0).ok()?;
+    let vector: Vec<f32> = embedding.to_vec();
+
+    if vector.is_empty() { None } else { Some(vector) }
+}
+
+fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(embedding.len() * 4);
+    for value in embedding {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+#[allow(dead_code)]
+fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn store_embedding(conn: &Connection, clip_id: i64, embedding: &[f32]) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let bytes = embedding_to_bytes(embedding);
+
+    let result = conn.execute(
+        "INSERT OR REPLACE INTO embeddings (clip_id, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![clip_id, bytes, EMBEDDING_MODEL_NAME, timestamp],
+    );
+
+    if let Err(e) = result {
+        log_warn!("Warning: failed to store embedding for clip {} ({e})", clip_id);
+    }
+}
+
+fn compute_and_store_embedding_async(clip_id: i64, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    thread::spawn(move || {
+        match embed_text(&text) {
+            Some(embedding) => {
+                let conn = open_db();
+                store_embedding(&conn, clip_id, &embedding);
+            }
+            None => {
+            }
+        }
+    });
 }
 
 fn run_combined() {
@@ -578,6 +691,10 @@ fn run_combined() {
 
     let discovered: DiscoveryMap = Arc::new(Mutex::new(HashMap::new()));
     let pending: PendingRequestsMap = Arc::new(Mutex::new(HashMap::new()));
+
+    // The discovery listener stays running: it just blocks on a UDP socket
+    // read (no polling, no wakeups, effectively zero CPU/battery cost while
+    // idle) and is what lets this device be found when a peer announces.
     let listener_device_id = device_config.device_id.clone();
     let listener_discovered = Arc::clone(&discovered);
     thread::spawn(move || {
@@ -592,12 +709,21 @@ fn run_combined() {
         let conn = open_db();
         run_watcher(&conn, watcher_paused, watcher_device_id);
     });
+
+    // One-shot presence announce + one-shot sync at startup, replacing the
+    // old 3-second broadcast loop and 2-minute sync interval. After this,
+    // everything is triggered by a real event (see NOTE above run_sync_loop's
+    // old definition).
     let startup_device_id = device_config.device_id.clone();
     let startup_device_name = device_config.device_name.clone();
     announce_presence_once(startup_device_id, startup_device_name);
     thread::spawn(move || {
         sync_all_peers(&sync_device_id, &sync_status_map);
     });
+    // Bidirectional catch-up: also tell every already-authorized peer to
+    // pull from us right now, in case we captured clips while they were
+    // offline. This is what makes "already connected" devices reconcile
+    // immediately instead of waiting for the next event on either side.
     notify_all_peers_to_pull();
 
     let conn = open_db();
@@ -635,9 +761,6 @@ fn run_hotkey_listener(device_id: String, status_map: SyncStatusMap) {
 fn open_browser_to_ui(device_id: &str, status_map: &SyncStatusMap) {
     log_info!("Hotkey pressed — opening clipboard UI...");
 
-    // Opening the UI is a real user action, so it's a legitimate moment to
-    // both re-announce our presence (in case a peer restarted recently) and
-    // sync with everyone we already know about.
     let device_name = load_or_create_device_config().device_name;
     announce_presence_once(device_id.to_string(), device_name);
 
@@ -650,8 +773,6 @@ fn open_browser_to_ui(device_id: &str, status_map: &SyncStatusMap) {
     open_ui_in_browser();
 }
 
-// Opens the default browser to the local dashboard. Uses the right shell
-// command per OS instead of assuming Windows.
 fn open_ui_in_browser() {
     let result = if cfg!(target_os = "windows") {
         process::Command::new("cmd")
@@ -711,19 +832,70 @@ fn detect_language(content: &str) -> String {
 }
 
 // --- SENSITIVE DATA DETECTION ---
-
 fn detect_sensitive(content: &str) -> bool {
     let lower = content.to_lowercase();
 
-    let keywords = [
-        "password", "passwd", "pwd=", "pwd:",
-        "secret", "api_key", "apikey", "api-key",
-        "access_token", "auth_token", "client_secret",
-        "private_key", "-----begin", "bearer ",
-        "aws_secret", "akia",
+    // High-confidence, unconditional signals — these essentially never
+    // false-positive regardless of surrounding content.
+    if lower.contains("-----begin") && lower.contains("private key") {
+        return true;
+    }
+    if contains_aws_access_key(content) {
+        return true;
+    }
+
+    let soft_keywords = [
+        "password", "passwd", "secret", "api_key", "apikey", "api-key",
+        "access_token", "auth_token", "client_secret", "private_key",
+        "aws_secret",
     ];
 
-    keywords.iter().any(|k| lower.contains(k))
+    for line in lower.lines() {
+        let trimmed = line.trim();
+        for keyword in &soft_keywords {
+            let Some(pos) = trimmed.find(keyword) else { continue };
+            let after = trimmed[pos + keyword.len()..].trim_start();
+
+            let looks_like_assignment = after.starts_with('=') || after.starts_with(':');
+            if !looks_like_assignment {
+                continue;
+            }
+
+            let value_part = after.trim_start_matches(['=', ':', ' ', '"', '\'']);
+            let value_token: String = value_part
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != ',' && *c != ';')
+                .collect();
+
+            let is_placeholder = value_token.len() < 6
+                || matches!(
+                    value_token.as_str(),
+                    "none" | "null" | "xxx" | "changeme" | "todo" | "\"\"" | "''" | "..."
+                );
+
+            if !is_placeholder {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn contains_aws_access_key(content: &str) -> bool {
+    let bytes = content.as_bytes();
+    if bytes.len() < 20 {
+        return false;
+    }
+    for i in 0..=(bytes.len() - 20) {
+        if &bytes[i..i + 4] == b"AKIA" {
+            let candidate = &bytes[i + 4..i + 20];
+            if candidate.iter().all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // --- DIGEST GENERATION ---
@@ -809,6 +981,8 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
 }
 
+// --- WEB SERVER ---
+
 fn run_server(
     conn: Connection,
     paused: Arc<AtomicBool>,
@@ -851,6 +1025,8 @@ fn run_server(
         } else if url == "/api/discovered" {
             serve_discovered(&discovered, request);
         } else if url == "/api/discover/scan" && method == tiny_http::Method::Post {
+            // On-demand replacement for the old always-on broadcaster: the UI
+            // calls this once when the user opens the pairing/sync panel.
             announce_presence_once(my_device_id.clone(), my_device_name.clone());
             let response = Response::from_string("{\"status\":\"scanning\"}");
             let _ = request.respond(response);
@@ -1035,7 +1211,6 @@ fn serve_pending_requests(pending: &PendingRequestsMap, request: tiny_http::Requ
 struct PairingResponseBody {
     accept: bool,
 }
-
 fn handle_pairing_respond(mut request: tiny_http::Request, url: &str, pending: &PendingRequestsMap, my_device_id: &str, my_device_name: &str, my_secret: &str, conn: &Connection, status_map: &SyncStatusMap) {
     let device_id = url.trim_start_matches("/api/pairing/respond/").to_string();
 
@@ -1081,6 +1256,8 @@ fn handle_pairing_respond(mut request: tiny_http::Request, url: &str, pending: &
         let peer_list = load_peers();
         if let Some(peer) = peer_list.peers.iter().find(|p| p.name == req.device_name) {
             sync_with_peer(conn, peer, my_device_id, status_map);
+            // Bidirectional: also tell them to pull from us right now, so
+            // both sides are caught up the moment the connection is live.
             notify_peer_to_pull(peer);
         }
     } else {
@@ -1113,9 +1290,6 @@ fn handle_pairing_complete(mut request: tiny_http::Request, my_device_id: &str, 
             if resp.accepted {
                 add_peer(&resp.device_name, &remote_ip, resp.port, &resp.secret);
                 log_info!("Pairing: '{}' accepted our request — now connected", resp.device_name);
-
-                // Handshake just completed on the requester's end too — sync
-                // right away rather than waiting on a timer.
                 let peer_list = load_peers();
                 if let Some(peer) = peer_list.peers.iter().find(|p| p.name == resp.device_name) {
                     sync_with_peer(conn, peer, my_device_id, status_map);
@@ -1177,9 +1351,6 @@ fn handle_sync_delete_request(conn: &Connection, my_secret: &str, mut request: t
         rusqlite::params![parsed.content_hash],
         |r| Ok((r.get(0)?, r.get(1)?)),
     );
-
-    // If we don't have this clip (already deleted, or it never synced to
-    // us), there's nothing to do — that's not an error.
     if let Ok((content, content_type)) = row {
         let _ = conn.execute(
             "DELETE FROM clips WHERE content_hash = ?1",
@@ -1720,10 +1891,11 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>, device_id: String) {
                     let language = detect_language(&current_text);
                     let is_sensitive = detect_sensitive(&current_text);
                     let digest = generate_digest(&current_text, &language);
-                    if save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language, is_sensitive, digest.as_deref(), &device_id) {
+                    if let Some(clip_id) = save_clip_with_ocr(conn, &current_text, "text", None, &hash, &language, is_sensitive, digest.as_deref(), &device_id) {
                         last_hash = hash;
                         handled_this_tick = true;
                         notify_all_peers_to_pull();
+                        compute_and_store_embedding_async(clip_id, current_text.clone());
                     }
                 }
             }
@@ -1754,11 +1926,12 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>, device_id: String) {
                                         .as_deref()
                                         .and_then(|t| generate_digest(t, "text"));
 
-                                    if save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a", is_sensitive, digest.as_deref(), &device_id) {
+                                    if let Some(clip_id) = save_clip_with_ocr(conn, &filename, "image", ocr_text.as_deref(), &hash, "n/a", is_sensitive, digest.as_deref(), &device_id) {
                                         last_hash = hash;
                                         log_info!("Saved screenshot: {}", filename);
                                         if let Some(text) = &ocr_text {
                                             log_info!("OCR extracted {} chars", text.len());
+                                            compute_and_store_embedding_async(clip_id, text.clone());
                                         }
                                         notify_all_peers_to_pull();
                                     }
@@ -1821,7 +1994,7 @@ fn save_clip_with_ocr(
     is_sensitive: bool,
     digest: Option<&str>,
     device_id: &str,
-) -> bool {
+) -> Option<i64> {
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     let result = conn.execute(
@@ -1834,11 +2007,11 @@ fn save_clip_with_ocr(
         Ok(_) => {
             let flag = if is_sensitive { " [flagged as sensitive]" } else { "" };
             log_info!("Saved {} clip ({}){} at {}", content_type, language, flag, timestamp);
-            true
+            Some(conn.last_insert_rowid())
         }
         Err(e) => {
             log_warn!("Error: failed to save clip to database ({e})");
-            false
+            None
         }
     }
 }

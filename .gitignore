@@ -1,5 +1,5 @@
 # Rust build artifacts
-/target
+/target/
 Cargo.lock
 
 # Local databases and media storage
@@ -13,3 +13,15 @@ clip_images/
 clipboard_daemon.log
 device_config.json
 peers.json
+
+# Local AI models — large binary files, not source; download separately
+# (see README for the exact ollama/huggingface source), don't commit them.
+models/*.gguf
+
+# Flutter / Android companion (added ahead of Step 5)
+android_companion/build/
+android_companion/.dart_tool/
+android_companion/.flutter-plugins
+android_companion/.flutter-plugins-dependencies
+*.iml
+.idea/
