@@ -49,6 +49,10 @@ const DISCOVERED_DEVICE_TTL_SECS: i64 = 300;
 const EMBEDDING_MODEL_PATH: &str = "models/nomic-embed-text-v1.5.Q4_K_M.gguf";
 const EMBEDDING_MODEL_NAME: &str = "nomic-embed-text-v1.5";
 const MAX_EMBED_INPUT_CHARS: usize = 1500;
+const EMBED_CTX_SIZE: u32 = 2048;
+const CHAT_MODEL_PATH: &str = "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+const MAX_GENERATION_TOKENS: usize = 300;
+const RAG_CONTEXT_CLIPS: usize = 5;
 
 #[derive(Serialize)]
 struct ClipJson {
@@ -183,6 +187,7 @@ struct DiscoveredDevice {
 }
 
 type DiscoveryMap = Arc<Mutex<HashMap<String, DiscoveredDevice>>>;
+
 fn announce_presence_once(device_id: String, device_name: String) {
     thread::spawn(move || {
         let socket = match UdpSocket::bind("0.0.0.0:0") {
@@ -206,8 +211,6 @@ fn announce_presence_once(device_id: String, device_name: String) {
 
         let target = format!("255.255.255.255:{}", DISCOVERY_PORT);
 
-        // A handful of pulses (not an infinite loop) so peers whose UDP
-        // packet gets dropped once still have a couple more chances.
         for _ in 0..3 {
             let _ = socket.send_to(message.as_bytes(), &target);
             thread::sleep(Duration::from_millis(300));
@@ -247,8 +250,6 @@ fn run_discovery_listener(my_device_id: String, discovered: DiscoveryMap) {
                         map.insert(device_id.clone(), DiscoveredDevice {
                             device_id, device_name, ip, port, last_seen: now,
                         });
-                        // Garbage-collect anything not seen in a while so
-                        // this map doesn't grow forever over a long uptime.
                         map.retain(|_, d| now - d.last_seen <= DISCOVERED_DEVICE_TTL_SECS);
                     }
                 }
@@ -259,8 +260,6 @@ fn run_discovery_listener(my_device_id: String, discovered: DiscoveryMap) {
         }
     }
 }
-
-// --- PAIRING (request / approve / auto-complete) ---
 
 #[derive(Clone, Serialize)]
 struct PendingRequest {
@@ -273,6 +272,7 @@ struct PendingRequest {
     received_at: i64,
 }
 
+// Requests nobody responds to shouldn't sit in memory forever.
 const PENDING_REQUEST_TTL_SECS: i64 = 300;
 
 fn prune_expired_pending(map: &mut HashMap<String, PendingRequest>) {
@@ -314,6 +314,7 @@ fn update_sync_status(status_map: &SyncStatusMap, peer_name: &str, synced_at: Op
         last_error: error,
     });
 }
+
 fn sync_all_peers(device_id: &str, status_map: &SyncStatusMap) {
     let peer_list = load_peers();
     if peer_list.peers.is_empty() {
@@ -324,6 +325,7 @@ fn sync_all_peers(device_id: &str, status_map: &SyncStatusMap) {
         sync_with_peer(&conn, peer, device_id, status_map);
     }
 }
+
 fn notify_all_peers_to_pull() {
     thread::spawn(|| {
         let peer_list = load_peers();
@@ -537,6 +539,8 @@ fn open_db() -> Connection {
         }
     };
 
+    // Needed per-connection so that deleting a clip automatically cleans up
+    // its embedding row too, instead of leaving it orphaned.
     let _ = conn.execute("PRAGMA foreign_keys = ON", []);
 
     let create_result = conn.execute(
@@ -560,7 +564,6 @@ fn open_db() -> Connection {
         log_warn!("Error: could not set up the database schema ({e})");
         process::exit(1);
     }
-
     let embeddings_result = conn.execute(
         "CREATE TABLE IF NOT EXISTS embeddings (
             clip_id    INTEGER PRIMARY KEY,
@@ -577,22 +580,42 @@ fn open_db() -> Connection {
         process::exit(1);
     }
 
+    // Migration for existing databases: CREATE TABLE IF NOT EXISTS doesn't
+    // add columns to a table that already exists, so this needs an explicit
+    // ALTER TABLE for anyone upgrading from before Step 3.
+    ensure_column(&conn, "clips", "hidden", "INTEGER NOT NULL DEFAULT 0");
+    ensure_column(&conn, "clips", "noise_reviewed", "INTEGER NOT NULL DEFAULT 0");
+
     conn
 }
+fn ensure_column(conn: &Connection, table: &str, column: &str, ddl_type: &str) {
+    let already_exists: Result<bool, _> = conn.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name = ?1", table),
+        rusqlite::params![column],
+        |row| Ok(row.get::<_, i64>(0)? > 0),
+    );
 
-// --- SEMANTIC EMBEDDINGS ---
+    if matches!(already_exists, Ok(true)) {
+        return;
+    }
+
+    let alter_sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, ddl_type);
+    if let Err(e) = conn.execute(&alter_sql, []) {
+        log_warn!("Warning: could not add column {}.{} ({e})", table, column);
+    }
+}
 fn embed_text(text: &str) -> Option<Vec<f32>> {
     use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
     use llama_cpp_2::model::{AddBos, LlamaModel};
+    use std::num::NonZeroU32;
 
     let model_path = std::path::Path::new(EMBEDDING_MODEL_PATH);
     if !model_path.exists() {
         return None;
     }
-
     let truncated: String = text.chars().take(MAX_EMBED_INPUT_CHARS).collect();
 
     let backend = LlamaBackend::init().ok()?;
@@ -601,12 +624,19 @@ fn embed_text(text: &str) -> Option<Vec<f32>> {
 
     let ctx_params = LlamaContextParams::default()
         .with_embeddings(true)
-        .with_pooling_type(LlamaPoolingType::Mean);
+        .with_pooling_type(LlamaPoolingType::Mean)
+        .with_n_ctx(NonZeroU32::new(EMBED_CTX_SIZE))
+        .with_n_batch(EMBED_CTX_SIZE)
+        .with_n_ubatch(EMBED_CTX_SIZE);
     let mut ctx = model.new_context(&backend, ctx_params).ok()?;
 
-    let tokens = model.str_to_token(&truncated, AddBos::Always).ok()?;
+    let mut tokens = model.str_to_token(&truncated, AddBos::Always).ok()?;
     if tokens.is_empty() {
         return None;
+    }
+    let max_tokens = (EMBED_CTX_SIZE as usize).saturating_sub(8);
+    if tokens.len() > max_tokens {
+        tokens.truncate(max_tokens);
     }
 
     let mut batch = LlamaBatch::new(tokens.len(), 1);
@@ -633,8 +663,6 @@ fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     }
     bytes
 }
-
-#[allow(dead_code)]
 fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
@@ -655,7 +683,6 @@ fn store_embedding(conn: &Connection, clip_id: i64, embedding: &[f32]) {
         log_warn!("Warning: failed to store embedding for clip {} ({e})", clip_id);
     }
 }
-
 fn compute_and_store_embedding_async(clip_id: i64, text: String) {
     if text.trim().is_empty() {
         return;
@@ -670,6 +697,57 @@ fn compute_and_store_embedding_async(clip_id: i64, text: String) {
             }
         }
     });
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a * norm_b)
+}
+fn find_similar_clips(conn: &Connection, query_embedding: &[f32], limit: usize) -> Vec<(i64, f32)> {
+    let mut stmt = match conn.prepare(
+        "SELECT e.clip_id, e.embedding FROM embeddings e
+         JOIN clips c ON c.id = e.clip_id
+         WHERE c.hidden = 0"
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log_warn!("Warning: failed to prepare embedding search query ({e})");
+            return Vec::new();
+        }
+    };
+
+    let rows = stmt.query_map([], |row| {
+        let clip_id: i64 = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        Ok((clip_id, blob))
+    });
+
+    let mut scored: Vec<(i64, f32)> = match rows {
+        Ok(rows) => rows
+            .filter_map(|r| r.ok())
+            .map(|(clip_id, blob)| {
+                let embedding = bytes_to_embedding(&blob);
+                let score = cosine_similarity(query_embedding, &embedding);
+                (clip_id, score)
+            })
+            .collect(),
+        Err(e) => {
+            log_warn!("Warning: embedding search query failed ({e})");
+            return Vec::new();
+        }
+    };
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    scored
 }
 
 fn run_combined() {
@@ -691,10 +769,6 @@ fn run_combined() {
 
     let discovered: DiscoveryMap = Arc::new(Mutex::new(HashMap::new()));
     let pending: PendingRequestsMap = Arc::new(Mutex::new(HashMap::new()));
-
-    // The discovery listener stays running: it just blocks on a UDP socket
-    // read (no polling, no wakeups, effectively zero CPU/battery cost while
-    // idle) and is what lets this device be found when a peer announces.
     let listener_device_id = device_config.device_id.clone();
     let listener_discovered = Arc::clone(&discovered);
     thread::spawn(move || {
@@ -709,21 +783,12 @@ fn run_combined() {
         let conn = open_db();
         run_watcher(&conn, watcher_paused, watcher_device_id);
     });
-
-    // One-shot presence announce + one-shot sync at startup, replacing the
-    // old 3-second broadcast loop and 2-minute sync interval. After this,
-    // everything is triggered by a real event (see NOTE above run_sync_loop's
-    // old definition).
     let startup_device_id = device_config.device_id.clone();
     let startup_device_name = device_config.device_name.clone();
     announce_presence_once(startup_device_id, startup_device_name);
     thread::spawn(move || {
         sync_all_peers(&sync_device_id, &sync_status_map);
     });
-    // Bidirectional catch-up: also tell every already-authorized peer to
-    // pull from us right now, in case we captured clips while they were
-    // offline. This is what makes "already connected" devices reconcile
-    // immediately instead of waiting for the next event on either side.
     notify_all_peers_to_pull();
 
     let conn = open_db();
@@ -760,7 +825,6 @@ fn run_hotkey_listener(device_id: String, status_map: SyncStatusMap) {
 
 fn open_browser_to_ui(device_id: &str, status_map: &SyncStatusMap) {
     log_info!("Hotkey pressed — opening clipboard UI...");
-
     let device_name = load_or_create_device_config().device_name;
     announce_presence_once(device_id.to_string(), device_name);
 
@@ -772,7 +836,6 @@ fn open_browser_to_ui(device_id: &str, status_map: &SyncStatusMap) {
 
     open_ui_in_browser();
 }
-
 fn open_ui_in_browser() {
     let result = if cfg!(target_os = "windows") {
         process::Command::new("cmd")
@@ -830,13 +893,8 @@ fn detect_language(content: &str) -> String {
         "text".to_string()
     }
 }
-
-// --- SENSITIVE DATA DETECTION ---
 fn detect_sensitive(content: &str) -> bool {
     let lower = content.to_lowercase();
-
-    // High-confidence, unconditional signals — these essentially never
-    // false-positive regardless of surrounding content.
     if lower.contains("-----begin") && lower.contains("private key") {
         return true;
     }
@@ -881,7 +939,6 @@ fn detect_sensitive(content: &str) -> bool {
 
     false
 }
-
 fn contains_aws_access_key(content: &str) -> bool {
     let bytes = content.as_bytes();
     if bytes.len() < 20 {
@@ -896,6 +953,232 @@ fn contains_aws_access_key(content: &str) -> bool {
         }
     }
     false
+}
+fn is_clipboard_noise(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if trimmed.chars().count() <= 3 && !trimmed.chars().any(|c| c.is_alphanumeric()) {
+        return true;
+    }
+
+    false
+}
+fn with_loaded_chat_model<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&llama_cpp_2::model::LlamaModel, &llama_cpp_2::llama_backend::LlamaBackend) -> R,
+{
+    use llama_cpp_2::llama_backend::LlamaBackend;
+    use llama_cpp_2::model::params::LlamaModelParams;
+    use llama_cpp_2::model::LlamaModel;
+
+    let model_path = std::path::Path::new(CHAT_MODEL_PATH);
+    if !model_path.exists() {
+        return None;
+    }
+
+    let backend = LlamaBackend::init().ok()?;
+    let model = LlamaModel::load_from_file(&backend, model_path, &LlamaModelParams::default()).ok()?;
+    Some(f(&model, &backend))
+}
+fn generate(
+    model: &llama_cpp_2::model::LlamaModel,
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+    prompt: &str,
+    max_tokens: usize,
+) -> Option<String> {
+    use llama_cpp_2::context::params::LlamaContextParams;
+    use llama_cpp_2::llama_batch::LlamaBatch;
+    use llama_cpp_2::model::{AddBos, Special};
+    use llama_cpp_2::sampling::LlamaSampler;
+    use std::num::NonZeroU32;
+    const CHAT_CTX_SIZE: u32 = 4096;
+    let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(CHAT_CTX_SIZE));
+    let mut ctx = model.new_context(backend, ctx_params).ok()?;
+
+    let tokens = model.str_to_token(prompt, AddBos::Always).ok()?;
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut batch = LlamaBatch::new(tokens.len(), 1);
+    for (i, token) in tokens.iter().enumerate() {
+        let is_last = i == tokens.len() - 1;
+        if batch.add(*token, i as i32, &[0], is_last).is_err() {
+            return None;
+        }
+    }
+    if ctx.decode(&mut batch).is_err() {
+        return None;
+    }
+
+    let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+    let eos_token = model.token_eos();
+    let mut generated = String::new();
+    let mut pos = tokens.len() as i32;
+
+    for _ in 0..max_tokens {
+        let token = sampler.sample(&ctx, 0);
+        if token == eos_token {
+            break;
+        }
+
+        match model.token_to_str(token, Special::Plaintext) {
+            Ok(piece) => generated.push_str(&piece),
+            Err(_) => break,
+        }
+
+        let mut next_batch = LlamaBatch::new(1, 1);
+        if next_batch.add(token, pos, &[0], true).is_err() {
+            break;
+        }
+        if ctx.decode(&mut next_batch).is_err() {
+            break;
+        }
+        pos += 1;
+    }
+
+    if generated.trim().is_empty() { None } else { Some(generated) }
+}
+
+fn sweep_recent_noise_with_model(
+    conn: &Connection,
+    model: &llama_cpp_2::model::LlamaModel,
+    backend: &llama_cpp_2::llama_backend::LlamaBackend,
+) {
+    let mut stmt = match conn.prepare(
+        "SELECT id, content FROM clips
+         WHERE noise_reviewed = 0 AND hidden = 0 AND pinned = 0 AND content_type = 'text'
+         ORDER BY created_at DESC LIMIT 20"
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log_warn!("Noise sweep: failed to query candidates ({e})");
+            return;
+        }
+    };
+
+    let candidates: Vec<(i64, String)> = match stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            log_warn!("Noise sweep: query failed ({e})");
+            return;
+        }
+    };
+
+    for (clip_id, content) in candidates {
+        let snippet: String = content.chars().take(300).collect();
+        let prompt = format!(
+            "Classify this clipboard entry as NOISE (an accidental partial \
+             selection, with no real informational value) or KEEP (anything \
+             a person plausibly meant to copy). Reply with exactly one word, \
+             NOISE or KEEP.\n\nClipboard entry:\n{}\n\nAnswer:",
+            snippet
+        );
+
+        let verdict = generate(model, backend, &prompt, 5);
+        let is_noise = verdict
+            .map(|v| v.to_uppercase().contains("NOISE"))
+            .unwrap_or(false);
+
+        let result = conn.execute(
+            "UPDATE clips SET hidden = ?1, noise_reviewed = 1 WHERE id = ?2",
+            rusqlite::params![is_noise, clip_id],
+        );
+        if let Err(e) = result {
+            log_warn!("Noise sweep: failed to update clip {} ({e})", clip_id);
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AiQueryBody {
+    prompt: String,
+}
+
+#[derive(Serialize)]
+struct AiQueryResponse {
+    answer: String,
+    sources: Vec<i64>,
+}
+fn handle_ai_query(mut request: tiny_http::Request) {
+    let mut body = String::new();
+    if request.as_reader().read_to_string(&mut body).is_err() {
+        let response = Response::from_string("Bad request").with_status_code(400);
+        let _ = request.respond(response);
+        return;
+    }
+
+    let parsed = match serde_json::from_str::<AiQueryBody>(&body) {
+        Ok(b) => b,
+        Err(_) => {
+            let response = Response::from_string("Bad request: expected {\"prompt\": \"...\"}").with_status_code(400);
+            let _ = request.respond(response);
+            return;
+        }
+    };
+
+    if !std::path::Path::new(CHAT_MODEL_PATH).exists() || !std::path::Path::new(EMBEDDING_MODEL_PATH).exists() {
+        let response = Response::from_string(
+            "{\"error\":\"AI models not installed. See models/README.md for setup.\"}"
+        ).with_status_code(503);
+        let _ = request.respond(response);
+        return;
+    }
+
+    let query_embedding = embed_text(&parsed.prompt);
+    let conn = open_db();
+
+    let similar_clips: Vec<(i64, f32)> = match &query_embedding {
+        Some(embedding) => find_similar_clips(&conn, embedding, RAG_CONTEXT_CLIPS),
+        None => Vec::new(),
+    };
+
+    let mut context_text = String::new();
+    let mut source_ids = Vec::new();
+    for (clip_id, _score) in &similar_clips {
+        let content: Result<String, _> = conn.query_row(
+            "SELECT content FROM clips WHERE id = ?1",
+            rusqlite::params![clip_id],
+            |row| row.get(0),
+        );
+        if let Ok(text) = content {
+            let snippet: String = text.chars().take(500).collect();
+            context_text.push_str(&format!("- {}\n", snippet));
+            source_ids.push(*clip_id);
+        }
+    }
+
+    let full_prompt = if context_text.is_empty() {
+        format!("Answer the user's question concisely.\n\nQuestion: {}\n\nAnswer:", parsed.prompt)
+    } else {
+        format!(
+            "Use the following past clipboard entries as context if relevant. \
+             Answer concisely.\n\nContext:\n{}\nQuestion: {}\n\nAnswer:",
+            context_text, parsed.prompt
+        )
+    };
+
+    let result = with_loaded_chat_model(|model, backend| {
+        // Reuse this one model load for the deferred noise sweep too,
+        // before spending it on the actual answer.
+        sweep_recent_noise_with_model(&conn, model, backend);
+        generate(model, backend, &full_prompt, MAX_GENERATION_TOKENS)
+    });
+
+    let answer = match result.flatten() {
+        Some(text) => text.trim().to_string(),
+        None => "I couldn't generate a response — check that the chat model file exists and is a valid GGUF model.".to_string(),
+    };
+
+    let response_body = AiQueryResponse { answer, sources: source_ids };
+    let json = serde_json::to_string(&response_body).unwrap_or_else(|_| "{}".to_string());
+    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let response = Response::from_string(json).with_header(header);
+    let _ = request.respond(response);
 }
 
 // --- DIGEST GENERATION ---
@@ -1025,8 +1308,6 @@ fn run_server(
         } else if url == "/api/discovered" {
             serve_discovered(&discovered, request);
         } else if url == "/api/discover/scan" && method == tiny_http::Method::Post {
-            // On-demand replacement for the old always-on broadcaster: the UI
-            // calls this once when the user opens the pairing/sync panel.
             announce_presence_once(my_device_id.clone(), my_device_name.clone());
             let response = Response::from_string("{\"status\":\"scanning\"}");
             let _ = request.respond(response);
@@ -1056,6 +1337,10 @@ fn run_server(
             handle_sync_pin_request(&conn, &my_secret, request);
         } else if url.starts_with("/api/sync/pull") {
             serve_sync_pull(&conn, &my_secret, request, &url);
+        } else if url == "/api/ai/query" && method == tiny_http::Method::Post {
+            thread::spawn(move || {
+                handle_ai_query(request);
+            });
         } else if url.starts_with("/api/clips/") && url.ends_with("/toggle-pin") && method == tiny_http::Method::Post {
             toggle_pin(&conn, request, &url);
         } else if url.starts_with("/api/clips/") && method == tiny_http::Method::Delete {
@@ -1256,8 +1541,6 @@ fn handle_pairing_respond(mut request: tiny_http::Request, url: &str, pending: &
         let peer_list = load_peers();
         if let Some(peer) = peer_list.peers.iter().find(|p| p.name == req.device_name) {
             sync_with_peer(conn, peer, my_device_id, status_map);
-            // Bidirectional: also tell them to pull from us right now, so
-            // both sides are caught up the moment the connection is live.
             notify_peer_to_pull(peer);
         }
     } else {
@@ -1293,7 +1576,6 @@ fn handle_pairing_complete(mut request: tiny_http::Request, my_device_id: &str, 
                 let peer_list = load_peers();
                 if let Some(peer) = peer_list.peers.iter().find(|p| p.name == resp.device_name) {
                     sync_with_peer(conn, peer, my_device_id, status_map);
-                    // Bidirectional: tell them to pull from us too.
                     notify_peer_to_pull(peer);
                 }
             }
@@ -1641,9 +1923,6 @@ fn delete_clip(conn: &Connection, request: tiny_http::Request, url: &str) {
                 }
             }
             log_info!("Deleted clip {}", id);
-
-            // Live-propagate to every connected peer right now, instead of
-            // waiting for the next pull.
             propagate_delete_to_peers(content_hash);
 
             let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
@@ -1713,12 +1992,13 @@ fn fetch_clips(conn: &Connection, search_query: Option<&str>) -> Vec<ClipJson> {
     if let Some(q) = search_query {
         sql = "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive, digest
                FROM clips
-               WHERE content LIKE ?1 OR ocr_text LIKE ?1
+               WHERE (content LIKE ?1 OR ocr_text LIKE ?1) AND hidden = 0
                ORDER BY pinned DESC, created_at DESC LIMIT 100";
         pattern = format!("%{}%", q);
     } else {
         sql = "SELECT id, content, content_type, created_at, ocr_text, language, pinned, is_sensitive, digest
                FROM clips
+               WHERE hidden = 0
                ORDER BY pinned DESC, created_at DESC LIMIT 100";
         pattern = String::new();
     }
@@ -1884,7 +2164,7 @@ fn run_watcher(conn: &Connection, paused: Arc<AtomicBool>, device_id: String) {
         let mut handled_this_tick = false;
 
         if let Ok(current_text) = clipboard.get_text() {
-            if !current_text.is_empty() {
+            if !current_text.is_empty() && !is_clipboard_noise(&current_text) {
                 let hash = hash_bytes(current_text.as_bytes());
 
                 if hash != last_hash {
